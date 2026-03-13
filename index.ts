@@ -793,12 +793,7 @@ app.post('/api/v1/auth/login/phone', async (req: Request, res: Response) => {
   }
 
   if (!worker) {
-    res.status(401).json({ error: 'invalid_credentials', message: 'Invalid phone number or PIN.' });
-    return;
-  }
-
-  if (worker.pin && pin !== worker.pin) {
-    res.status(401).json({ error: 'invalid_credentials', message: 'Invalid phone number or PIN.' });
+    res.status(401).json({ error: 'invalid_credentials', message: 'Invalid phone number.' });
     return;
   }
 
