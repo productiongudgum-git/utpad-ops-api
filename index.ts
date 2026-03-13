@@ -737,16 +737,7 @@ app.get('/api/v1/ops/events/stream', (_req: Request, res: Response) => {
   });
 });
 
-// --- AUTH MOCK ENDPOINTS ---
-
-const MOCK_USER = {
-  userId: 'admin-1',
-  tenantId: 'tenant-1',
-  name: 'Admin User',
-  role: 'Platform_Admin',
-  factoryIds: ['factory-1'],
-  phone: '9999999999',
-};
+// --- AUTH ENDPOINTS ---
 
 const MOCK_TOKENS = {
   accessToken: 'mock-access-token',
@@ -754,8 +745,75 @@ const MOCK_TOKENS = {
   expiresIn: 3600,
 };
 
-app.post('/api/v1/auth/login/phone', (_req: Request, res: Response) => {
-  res.json({ ...MOCK_TOKENS, user: MOCK_USER });
+async function fetchWorkerByPhoneFromSupabase(phone: string): Promise<WorkerCredential | null> {
+  const workers = await supabaseRequest<any[]>(
+    `ops_workers?select=worker_id,name,phone,pin,worker_role,active,created_at&phone=eq.${encodeURIComponent(phone)}&active=eq.true&limit=1`,
+  );
+  if (workers.length === 0) {
+    return null;
+  }
+  const workerId = String(workers[0].worker_id);
+  const accessRows = await supabaseRequest<any[]>(
+    `ops_worker_module_access?select=worker_id,module&worker_id=eq.${encodeURIComponent(workerId)}&limit=20`,
+  );
+  const modulesByWorkerId = new Map<string, WorkerModule[]>();
+  accessRows.forEach((row) => {
+    const module = String(row.module).toLowerCase();
+    if (!MODULE_SET.has(module)) return;
+    const existing = modulesByWorkerId.get(workerId) ?? [];
+    if (!existing.includes(module as WorkerModule)) {
+      existing.push(module as WorkerModule);
+      modulesByWorkerId.set(workerId, existing);
+    }
+  });
+  return mapWorkerRow(workers[0], modulesByWorkerId);
+}
+
+app.post('/api/v1/auth/login/phone', async (req: Request, res: Response) => {
+  const phone = safeText(req.body?.phone, '');
+  const pin = safeText(req.body?.pin, '');
+
+  if (!phone) {
+    res.status(400).json({ error: 'missing_phone', message: 'Phone number is required.' });
+    return;
+  }
+
+  let worker: WorkerCredential | null = null;
+
+  if (SUPABASE_ENABLED) {
+    try {
+      worker = await fetchWorkerByPhoneFromSupabase(phone);
+    } catch (err) {
+      console.error('Supabase worker fetch failed during login, falling back to memory store.', err);
+    }
+  }
+
+  if (!worker) {
+    worker = Array.from(fallbackWorkers.values()).find((w) => w.phone === phone && w.active) ?? null;
+  }
+
+  if (!worker) {
+    res.status(401).json({ error: 'invalid_credentials', message: 'Invalid phone number or PIN.' });
+    return;
+  }
+
+  if (worker.pin && pin !== worker.pin) {
+    res.status(401).json({ error: 'invalid_credentials', message: 'Invalid phone number or PIN.' });
+    return;
+  }
+
+  res.json({
+    ...MOCK_TOKENS,
+    user: {
+      userId: worker.id,
+      tenantId: 'tenant-1',
+      phone: worker.phone,
+      name: worker.name,
+      role: worker.role,
+      factoryIds: [],
+      allowedModules: worker.allowedModules,
+    },
+  });
 });
 
 app.post('/api/v1/auth/refresh', (_req: Request, res: Response) => {
@@ -767,7 +825,7 @@ app.post('/api/v1/auth/logout', (_req: Request, res: Response) => {
 });
 
 app.get('/api/v1/auth/me', (_req: Request, res: Response) => {
-  res.json(MOCK_USER);
+  res.json({ userId: 'admin-1', tenantId: 'tenant-1', name: 'Admin User', role: 'Platform_Admin', factoryIds: ['factory-1'], phone: '9999999999' });
 });
 
 app.get('/api/v1/auth/permissions', (_req: Request, res: Response) => {
