@@ -852,7 +852,13 @@ app.post('/api/v1/auth/sync/events', (req: Request, res: Response) => {
   res.json({ syncedCount: req.body.events?.length || 0, conflicts: [] });
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// Export the app for Vercel serverless runtime.
+// app.listen() is only called in local development (non-Vercel environments).
+export default app;
+
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 8080;
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
