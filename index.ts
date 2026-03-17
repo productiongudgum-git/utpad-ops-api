@@ -642,6 +642,11 @@ app.delete('/api/v1/ops/workers/:workerId', async (req: Request, res: Response) 
 
   try {
     if (SUPABASE_ENABLED) {
+      const existing = await fetchWorkerByIdFromSupabase(workerId);
+      if (!existing) {
+        res.status(404).json({ error: 'worker_not_found', message: `Worker ${workerId} does not exist.` });
+        return;
+      }
       await supabaseRequest<any>(`ops_workers?worker_id=eq.${encodeURIComponent(workerId)}`, {
         method: 'DELETE',
         headers: { Prefer: 'return=minimal' },
@@ -778,6 +783,11 @@ app.post('/api/v1/auth/login/phone', async (req: Request, res: Response) => {
     return;
   }
 
+  if (!pin) {
+    res.status(400).json({ error: 'missing_pin', message: 'PIN is required.' });
+    return;
+  }
+
   let worker: WorkerCredential | null = null;
 
   if (SUPABASE_ENABLED) {
@@ -793,7 +803,12 @@ app.post('/api/v1/auth/login/phone', async (req: Request, res: Response) => {
   }
 
   if (!worker) {
-    res.status(401).json({ error: 'invalid_credentials', message: 'Invalid phone number.' });
+    res.status(401).json({ error: 'invalid_credentials', message: 'Invalid phone number or PIN.' });
+    return;
+  }
+
+  if (worker.pin !== pin) {
+    res.status(401).json({ error: 'invalid_credentials', message: 'Invalid phone number or PIN.' });
     return;
   }
 
