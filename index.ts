@@ -128,6 +128,29 @@ function toAllowedModules(modules: unknown): WorkerModule[] {
   return OPS_MODULES.filter((module) => normalized.includes(module));
 }
 
+/**
+ * Generates the daily batch code from a given date.
+ *
+ * Format: {day-digits-as-letters}{MM}{YY}
+ *   Digit map: 0=A 1=B 2=C 3=D 4=E 5=F 6=G 7=H 8=I 9=J
+ *
+ * Example: 18-03-2026  →  day=18 → "BI",  month=03,  year=26  →  "BI0326"
+ *
+ * One batch code per calendar day — all modules share it.
+ */
+const DIGIT_TO_LETTER: Record<string, string> = {
+  '0': 'A', '1': 'B', '2': 'C', '3': 'D', '4': 'E',
+  '5': 'F', '6': 'G', '7': 'H', '8': 'I', '9': 'J',
+};
+
+function generateBatchCode(date: Date = new Date()): string {
+  const dd = String(date.getDate()).padStart(2, '0');
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const yy = String(date.getFullYear()).slice(-2);
+  const dayLetters = dd.split('').map((d) => DIGIT_TO_LETTER[d]).join('');
+  return `${dayLetters}${mm}${yy}`;
+}
+
 function toPayload(payload: unknown): Record<string, string | number | boolean | null> {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return {};
@@ -354,7 +377,7 @@ function parseIncomingEvent(body: any): OperationEvent {
     workerName: safeText(body?.workerName, 'Mobile Worker'),
     workerRole: safeText(body?.workerRole, 'Worker'),
     createdAt: new Date().toISOString(),
-    batchCode: safeText(body?.batchCode, 'N/A'),
+    batchCode: generateBatchCode(new Date()),
     quantity: Math.max(0, safeNumber(body?.quantity, 0)),
     unit: safeText(body?.unit, 'units'),
     summary: safeText(body?.summary, 'Operation event'),
@@ -450,6 +473,17 @@ app.get('/api/v1/ops/supabase/config', (_req: Request, res: Response) => {
     restApiUrl: SUPABASE_REST_BASE_URL,
     dbEnabled: SUPABASE_ENABLED,
     usingFallbackStorage: !SUPABASE_ENABLED,
+  });
+});
+
+app.get('/api/v1/ops/batch-code/today', (_req: Request, res: Response) => {
+  const today = new Date();
+  const dd = String(today.getDate()).padStart(2, '0');
+  const mm = String(today.getMonth() + 1).padStart(2, '0');
+  const yyyy = today.getFullYear();
+  res.json({
+    batchCode: generateBatchCode(today),
+    date: `${yyyy}-${mm}-${dd}`,
   });
 });
 
