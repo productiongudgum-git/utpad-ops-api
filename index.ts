@@ -463,6 +463,209 @@ function createEventInFallback(event: OperationEvent): OperationEvent {
   return event;
 }
 
+// --- PRODUCTION INVENTORY DEDUCTION ---
+
+interface RecipeLineRow {
+  ingredient_id: string;
+  qty: number;
+}
+
+interface IngredientStockRow {
+  id: string;
+  name: string;
+  current_stock: number;
+  reorder_point: number;
+  default_unit: string;
+}
+
+interface InventoryDeduction {
+  ingredientId: string;
+  ingredientName: string;
+  deductedQty: number;
+  unit: string;
+  previousStock: number;
+  newStock: number;
+  belowReorderPoint: boolean;
+}
+
+interface ProductionDeductionResult {
+  recipeFound: boolean;
+  skipped: boolean;
+  skipReason?: string;
+  deductions: InventoryDeduction[];
+  lowStockAlerts: string[];
+}
+
+/**
+ * Returns the recipe_id linked to a SKU, or null if not found.
+ */
+async function fetchRecipeIdForSku(skuId: string): Promise<string | null> {
+  try {
+    const rows = await supabaseRequest<any[]>(
+      `gg_skus?select=id,recipe_id&id=eq.${encodeURIComponent(skuId)}&limit=1`,
+    );
+    const recipeId = rows[0]?.recipe_id;
+    return typeof recipeId === 'string' && recipeId ? recipeId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns the reference batch size for a recipe.
+ * Tries `batch_size` column first, falls back to `yield_factor`.
+ */
+async function fetchRecipeBatchSize(recipeId: string): Promise<number | null> {
+  const rows = await supabaseRequest<any[]>(
+    `gg_recipes?select=id,batch_size,yield_factor&id=eq.${encodeURIComponent(recipeId)}&limit=1`,
+  );
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  const batchSize = Number(row.batch_size ?? row.yield_factor);
+  return Number.isFinite(batchSize) && batchSize > 0 ? batchSize : null;
+}
+
+/**
+ * Returns all ingredient lines for a recipe from gg_recipe_lines.
+ */
+async function fetchRecipeLines(recipeId: string): Promise<RecipeLineRow[]> {
+  const rows = await supabaseRequest<any[]>(
+    `gg_recipe_lines?select=ingredient_id,qty&recipe_id=eq.${encodeURIComponent(recipeId)}`,
+  );
+  return rows
+    .map((r) => ({ ingredient_id: String(r.ingredient_id), qty: Number(r.qty) }))
+    .filter((r) => r.ingredient_id && Number.isFinite(r.qty) && r.qty > 0);
+}
+
+/**
+ * Fetches current stock rows for multiple ingredients in a single request.
+ */
+async function fetchIngredientStocks(ingredientIds: string[]): Promise<Map<string, IngredientStockRow>> {
+  if (ingredientIds.length === 0) return new Map();
+  const inClause = ingredientIds.map(encodeURIComponent).join(',');
+  const rows = await supabaseRequest<any[]>(
+    `gg_ingredients?select=id,name,current_stock,reorder_point,default_unit&id=in.(${inClause})`,
+  );
+  const map = new Map<string, IngredientStockRow>();
+  for (const row of rows) {
+    map.set(String(row.id), {
+      id: String(row.id),
+      name: String(row.name ?? 'Unknown'),
+      current_stock: Number(row.current_stock ?? 0),
+      reorder_point: Number(row.reorder_point ?? 0),
+      default_unit: String(row.default_unit ?? 'kg'),
+    });
+  }
+  return map;
+}
+
+/**
+ * PATCHes a single ingredient's current_stock to the new value (floor 0).
+ */
+async function patchIngredientStock(ingredientId: string, newStock: number): Promise<void> {
+  await supabaseRequest<void>(
+    `gg_ingredients?id=eq.${encodeURIComponent(ingredientId)}`,
+    {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: { current_stock: Math.max(0, newStock) },
+    },
+  );
+}
+
+/**
+ * Orchestrates automatic inventory deduction for a production event.
+ *
+ * Steps:
+ *   1. Resolve recipe_id from payload (direct or via sku_id → gg_skus)
+ *   2. Fetch recipe batch_size and all recipe lines in parallel
+ *   3. Batch-fetch current stock for every ingredient in the recipe
+ *   4. Deduct proportionally: deduct = recipe_qty × (actual_output / batch_size)
+ *   5. PATCH each ingredient's current_stock; flag any that fall ≤ reorder_point
+ *
+ * This function never throws — errors are logged so they never block the event save.
+ */
+async function runProductionInventoryDeduction(event: OperationEvent): Promise<ProductionDeductionResult> {
+  const empty: ProductionDeductionResult = {
+    recipeFound: false,
+    skipped: true,
+    deductions: [],
+    lowStockAlerts: [],
+  };
+
+  const actualOutputQty = event.quantity;
+  if (!(actualOutputQty > 0)) {
+    return { ...empty, skipReason: 'Output quantity is zero or missing' };
+  }
+
+  // 1. Resolve recipe ID
+  let recipeId: string | null = null;
+  if (typeof event.payload.recipe_id === 'string' && event.payload.recipe_id) {
+    recipeId = event.payload.recipe_id;
+  } else if (typeof event.payload.sku_id === 'string' && event.payload.sku_id) {
+    recipeId = await fetchRecipeIdForSku(event.payload.sku_id);
+  }
+
+  if (!recipeId) {
+    return { ...empty, skipReason: 'No recipe linked to this production event' };
+  }
+
+  // 2. Fetch batch size + recipe lines in parallel
+  const [batchSize, lines] = await Promise.all([
+    fetchRecipeBatchSize(recipeId),
+    fetchRecipeLines(recipeId),
+  ]);
+
+  if (!batchSize) {
+    return { ...empty, recipeFound: true, skipReason: 'Recipe has no batch_size defined' };
+  }
+  if (lines.length === 0) {
+    return { ...empty, recipeFound: true, skipReason: 'Recipe has no ingredient lines' };
+  }
+
+  // 3. Batch-fetch current stock for all ingredients
+  const stockMap = await fetchIngredientStocks(lines.map((l) => l.ingredient_id));
+
+  // 4. Calculate and apply deductions
+  const ratio = actualOutputQty / batchSize;
+  const deductions: InventoryDeduction[] = [];
+  const lowStockAlerts: string[] = [];
+
+  for (const line of lines) {
+    const stock = stockMap.get(line.ingredient_id);
+    if (!stock) {
+      console.warn(`[inventory] Ingredient ${line.ingredient_id} not found in gg_ingredients, skipping.`);
+      continue;
+    }
+
+    const deductQty = Math.round(line.qty * ratio * 1000) / 1000; // 3 decimal places
+    const newStock = Math.max(0, stock.current_stock - deductQty);
+
+    try {
+      await patchIngredientStock(line.ingredient_id, newStock);
+    } catch (patchErr) {
+      console.error(`[inventory] Failed to deduct stock for "${stock.name}":`, patchErr);
+      continue;
+    }
+
+    const belowReorderPoint = stock.reorder_point > 0 && newStock <= stock.reorder_point;
+    deductions.push({
+      ingredientId: line.ingredient_id,
+      ingredientName: stock.name,
+      deductedQty: deductQty,
+      unit: stock.default_unit,
+      previousStock: stock.current_stock,
+      newStock,
+      belowReorderPoint,
+    });
+    if (belowReorderPoint) {
+      lowStockAlerts.push(stock.name);
+    }
+  }
+
+  return { recipeFound: true, skipped: false, deductions, lowStockAlerts };
+}
+
 // --- OPS ENDPOINTS ---
 
 app.get('/api/v1/ops/supabase/config', (_req: Request, res: Response) => {
@@ -503,6 +706,35 @@ app.post('/api/v1/ops/events', async (req: Request, res: Response) => {
     }
 
     broadcastEvent(createdEvent);
+
+    // Automatic inventory deduction for production events
+    if (parsed.module === 'production' && SUPABASE_ENABLED) {
+      let inventoryResult: ProductionDeductionResult = {
+        recipeFound: false,
+        skipped: true,
+        skipReason: 'Deduction not attempted',
+        deductions: [],
+        lowStockAlerts: [],
+      };
+      try {
+        inventoryResult = await runProductionInventoryDeduction(createdEvent);
+        if (inventoryResult.lowStockAlerts.length > 0) {
+          console.warn(
+            `[inventory] Low stock after production event ${createdEvent.id}:`,
+            inventoryResult.lowStockAlerts.join(', '),
+          );
+        }
+      } catch (deductionError) {
+        console.error('[inventory] Deduction failed (non-fatal):', deductionError);
+      }
+      res.status(201).json({
+        ...createdEvent,
+        inventoryDeductions: inventoryResult.deductions,
+        lowStockAlerts: inventoryResult.lowStockAlerts,
+      });
+      return;
+    }
+
     res.status(201).json(createdEvent);
   } catch (error) {
     res.status(400).json({
