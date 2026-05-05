@@ -11,5 +11,11 @@
             "src": "/(.*)",
             "dest": "index.ts"
         }
+    ],
+    "crons": [
+        {
+            "path": "/sync/zoho",
+            "schedule": "*/5 * * * *"
+        }
     ]
 }
