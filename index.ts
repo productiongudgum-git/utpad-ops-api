@@ -1239,22 +1239,13 @@ async function zohoGet<T>(path: string, accessToken: string): Promise<T> {
   return data as T;
 }
 
-async function fetchAllZohoInvoices(accessToken: string): Promise<ZohoInvoice[]> {
-  const all: ZohoInvoice[] = [];
-  let page = 1;
-  while (true) {
-    const data = await zohoGet<any>(`/books/v3/invoices?page=${page}&per_page=200`, accessToken);
-    const batch: ZohoInvoice[] = data.invoices ?? [];
-    all.push(...batch);
-    if (!data.page_context?.has_more_page) break;
-    page++;
-  }
-  return all;
-}
-
-async function fetchZohoInvoiceDetail(invoiceId: string, accessToken: string): Promise<ZohoInvoice> {
-  const data = await zohoGet<any>(`/books/v3/invoices/${encodeURIComponent(invoiceId)}`, accessToken);
-  return data.invoice as ZohoInvoice;
+async function fetchRecentZohoInvoices(accessToken: string): Promise<ZohoInvoice[]> {
+  const dateAfter = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const data = await zohoGet<any>(
+    `/books/v3/invoices?per_page=25&date_after=${dateAfter}`,
+    accessToken,
+  );
+  return (data.invoices ?? []) as ZohoInvoice[];
 }
 
 async function findOrCreateCustomer(customerName: string, zohoCustomerId: string): Promise<string | null> {
@@ -1298,6 +1289,7 @@ interface ZohoSyncResult {
 }
 
 async function syncZohoInvoices(): Promise<ZohoSyncResult> {
+  const deadline = Date.now() + 8_000;
   const result: ZohoSyncResult = { synced: 0, skipped: 0, errors: [] };
 
   if (!SUPABASE_ENABLED) {
@@ -1315,13 +1307,18 @@ async function syncZohoInvoices(): Promise<ZohoSyncResult> {
 
   let summaries: ZohoInvoice[];
   try {
-    summaries = await fetchAllZohoInvoices(accessToken);
+    summaries = await fetchRecentZohoInvoices(accessToken);
   } catch (err) {
     result.errors.push(`Invoice list: ${err instanceof Error ? err.message : String(err)}`);
     return result;
   }
 
   for (const summary of summaries) {
+    if (Date.now() > deadline) {
+      result.errors.push('Sync stopped: 8-second timeout reached.');
+      break;
+    }
+
     try {
       const existing = await supabaseRequest<any[]>(
         `gg_invoices?select=id,is_dispatched&zoho_invoice_id=eq.${encodeURIComponent(summary.invoice_id)}&limit=1`,
@@ -1331,36 +1328,18 @@ async function syncZohoInvoices(): Promise<ZohoSyncResult> {
         continue;
       }
 
-      const invoice = await fetchZohoInvoiceDetail(summary.invoice_id, accessToken);
-      const customerId = await findOrCreateCustomer(invoice.customer_name, invoice.customer_id);
-
-      const items: Array<{
-        flavor_id: string | null;
-        flavor_name: string;
-        quantity_boxes: number;
-        quantity_units: number;
-      }> = [];
-
-      for (const line of invoice.line_items ?? []) {
-        const flavor = await findFlavorForItem(line.item_name);
-        items.push({
-          flavor_id: flavor?.id ?? null,
-          flavor_name: flavor?.name ?? line.item_name,
-          quantity_boxes: Math.round((line.quantity / 15) * 100) / 100,
-          quantity_units: line.quantity,
-        });
-      }
+      const customerId = await findOrCreateCustomer(summary.customer_name, summary.customer_id);
 
       await supabaseRequest<void>('gg_invoices?on_conflict=zoho_invoice_id', {
         method: 'POST',
         headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
         body: {
-          invoice_number: invoice.invoice_number,
-          customer_name: invoice.customer_name,
+          invoice_number: summary.invoice_number,
+          customer_name: summary.customer_name,
           customer_id: customerId,
-          items,
-          expected_dispatch_date: invoice.due_date || null,
-          zoho_invoice_id: invoice.invoice_id,
+          items: [],
+          expected_dispatch_date: summary.due_date || null,
+          zoho_invoice_id: summary.invoice_id,
         },
       });
 
