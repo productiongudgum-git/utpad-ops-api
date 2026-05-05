@@ -1248,6 +1248,11 @@ async function fetchRecentZohoInvoices(accessToken: string): Promise<ZohoInvoice
   return (data.invoices ?? []) as ZohoInvoice[];
 }
 
+async function fetchZohoInvoiceDetail(invoiceId: string, accessToken: string): Promise<ZohoInvoice> {
+  const data = await zohoGet<any>(`/books/v3/invoices/${encodeURIComponent(invoiceId)}`, accessToken);
+  return data.invoice as ZohoInvoice;
+}
+
 async function findOrCreateCustomer(customerName: string, zohoCustomerId: string): Promise<string | null> {
   try {
     const rows = await supabaseRequest<any[]>('gg_customers?on_conflict=zoho_customer_id&select=id', {
@@ -1313,33 +1318,63 @@ async function syncZohoInvoices(): Promise<ZohoSyncResult> {
     return result;
   }
 
-  for (const summary of summaries) {
+  if (summaries.length === 0) {
+    return result;
+  }
+
+  // Single batch query to find which invoice IDs already exist in Supabase
+  const inClause = summaries.map((s) => s.invoice_id).join(',');
+  let existingIds: Set<string>;
+  try {
+    const existing = await supabaseRequest<any[]>(
+      `gg_invoices?select=zoho_invoice_id&zoho_invoice_id=in.(${inClause})`,
+    );
+    existingIds = new Set(existing.map((r) => String(r.zoho_invoice_id)));
+  } catch (err) {
+    result.errors.push(`Existence check: ${err instanceof Error ? err.message : String(err)}`);
+    return result;
+  }
+
+  const newSummaries = summaries.filter((s) => !existingIds.has(s.invoice_id));
+  result.skipped = summaries.length - newSummaries.length;
+
+  for (const summary of newSummaries) {
     if (Date.now() > deadline) {
       result.errors.push('Sync stopped: 8-second timeout reached.');
       break;
     }
 
     try {
-      const existing = await supabaseRequest<any[]>(
-        `gg_invoices?select=id,is_dispatched&zoho_invoice_id=eq.${encodeURIComponent(summary.invoice_id)}&limit=1`,
-      );
-      if (existing.length > 0 && existing[0].is_dispatched === true) {
-        result.skipped++;
-        continue;
-      }
+      const invoice = await fetchZohoInvoiceDetail(summary.invoice_id, accessToken);
+      const customerId = await findOrCreateCustomer(invoice.customer_name, invoice.customer_id);
 
-      const customerId = await findOrCreateCustomer(summary.customer_name, summary.customer_id);
+      const items: Array<{
+        flavor_id: string | null;
+        flavor_name: string;
+        quantity_units: number;
+        quantity_boxes: number;
+      }> = [];
+
+      for (const line of invoice.line_items ?? []) {
+        const flavor = await findFlavorForItem(line.item_name);
+        items.push({
+          flavor_id: flavor?.id ?? null,
+          flavor_name: flavor?.name ?? line.item_name,
+          quantity_units: line.quantity,
+          quantity_boxes: Math.floor(line.quantity / 15),
+        });
+      }
 
       await supabaseRequest<void>('gg_invoices?on_conflict=zoho_invoice_id', {
         method: 'POST',
         headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
         body: {
-          invoice_number: summary.invoice_number,
-          customer_name: summary.customer_name,
+          invoice_number: invoice.invoice_number,
+          customer_name: invoice.customer_name,
           customer_id: customerId,
-          items: [],
-          expected_dispatch_date: summary.due_date || null,
-          zoho_invoice_id: summary.invoice_id,
+          items,
+          expected_dispatch_date: invoice.due_date || null,
+          zoho_invoice_id: invoice.invoice_id,
         },
       });
 
