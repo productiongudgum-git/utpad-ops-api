@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(find C:UsersBHARATDocumentsGitHubutpad-web -not -path */node_modules/* -type d)"
+      "Bash(find C:UsersBHARATDocumentsGitHubutpad-web -not -path */node_modules/* -type d)",
+      "Bash(xargs grep:*)",
+      "Bash(grep -r \"production_batches\\\\|production_batch_ingredients\" /c/Users/BHARAT/Documents/GitHub/utpad-android --include=*.kt)"
     ]
   }
 }

@@ -1118,6 +1118,65 @@ app.post('/api/v1/auth/sync/events', (req: Request, res: Response) => {
   res.json({ syncedCount: req.body.events?.length || 0, conflicts: [] });
 });
 
+// --- ZOHO OAUTH ---
+
+const ZOHO_CLIENT_ID = '1000.1VKGSEFS2WFZGJXKU0UDK6HJEMPGUL';
+const ZOHO_CLIENT_SECRET = '6d8e6e7de6b6fb65c82954a2ceab9db11190d258d1';
+const ZOHO_REDIRECT_URI = 'https://utpad-ops-api-seven.vercel.app/auth/zoho/callback';
+const ZOHO_SCOPE = process.env.ZOHO_SCOPE ?? 'ZohoCRM.modules.ALL,ZohoCRM.settings.ALL';
+
+let zohoRefreshToken: string | null = null;
+
+app.get('/auth/zoho/start', (_req: Request, res: Response) => {
+  const params = new URLSearchParams({
+    scope: ZOHO_SCOPE,
+    client_id: ZOHO_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: ZOHO_REDIRECT_URI,
+    access_type: 'offline',
+  });
+  res.redirect(`https://accounts.zoho.in/oauth/v2/auth?${params.toString()}`);
+});
+
+app.get('/auth/zoho/callback', async (req: Request, res: Response) => {
+  const code = safeText(req.query.code as string, '');
+  if (!code) {
+    res.status(400).json({ error: 'missing_code', message: 'Authorization code not found in callback.' });
+    return;
+  }
+
+  const body = new URLSearchParams({
+    code,
+    client_id: ZOHO_CLIENT_ID,
+    client_secret: ZOHO_CLIENT_SECRET,
+    redirect_uri: ZOHO_REDIRECT_URI,
+    grant_type: 'authorization_code',
+  });
+
+  try {
+    const tokenRes = await fetch('https://accounts.zoho.in/oauth/v2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    const data = await tokenRes.json() as Record<string, unknown>;
+
+    if (!tokenRes.ok || data.error) {
+      res.status(400).json({ error: 'token_exchange_failed', details: data });
+      return;
+    }
+
+    zohoRefreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : null;
+    res.json(data);
+  } catch (error) {
+    console.error('Zoho token exchange failed:', error);
+    res.status(500).json({
+      error: 'token_exchange_error',
+      message: error instanceof Error ? error.message : 'Failed to exchange Zoho authorization code.',
+    });
+  }
+});
+
 // Export the app for Vercel serverless runtime.
 // app.listen() is only called in local development (non-Vercel environments).
 export default app;
