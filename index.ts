@@ -1123,7 +1123,7 @@ app.post('/api/v1/auth/sync/events', (req: Request, res: Response) => {
 const ZOHO_CLIENT_ID = '1000.1VKGSEFS2WFZGJXKU0UDK6HJEMPGUL';
 const ZOHO_CLIENT_SECRET = '6d8e6e7de6b6fb65c82954a2ceab9db11190d258d1';
 const ZOHO_REDIRECT_URI = 'https://utpad-ops-api-seven.vercel.app/auth/zoho/callback';
-const ZOHO_SCOPE = process.env.ZOHO_SCOPE ?? 'ZohoCRM.modules.ALL,ZohoCRM.settings.ALL';
+const ZOHO_SCOPE = process.env.ZOHO_SCOPE ?? 'ZohoBooks.invoices.READ,ZohoBooks.contacts.READ,ZohoBooks.customerpayments.READ';
 
 let zohoRefreshToken: string | null = null;
 
@@ -1134,6 +1134,7 @@ app.get('/auth/zoho/start', (_req: Request, res: Response) => {
     response_type: 'code',
     redirect_uri: ZOHO_REDIRECT_URI,
     access_type: 'offline',
+    prompt: 'consent',
   });
   res.redirect(`https://accounts.zoho.in/oauth/v2/auth?${params.toString()}`);
 });
