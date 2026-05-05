@@ -1120,12 +1120,16 @@ app.post('/api/v1/auth/sync/events', (req: Request, res: Response) => {
 
 // --- ZOHO OAUTH ---
 
-const ZOHO_CLIENT_ID = '1000.1VKGSEFS2WFZGJXKU0UDK6HJEMPGUL';
-const ZOHO_CLIENT_SECRET = '6d8e6e7de6b6fb65c82954a2ceab9db11190d258d1';
+const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID ?? '1000.1VKGSEFS2WFZGJXKU0UDK6HJEMPGUL';
+const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET ?? '6d8e6e7de6b6fb65c82954a2ceab9db11190d258d1';
 const ZOHO_REDIRECT_URI = 'https://utpad-ops-api-seven.vercel.app/auth/zoho/callback';
 const ZOHO_SCOPE = process.env.ZOHO_SCOPE ?? 'ZohoBooks.invoices.READ,ZohoBooks.contacts.READ,ZohoBooks.customerpayments.READ,ZohoBooks.settings.READ';
+const ZOHO_ORG_ID = process.env.ZOHO_ORG_ID ?? '60023909866';
+const ZOHO_API_DOMAIN = process.env.ZOHO_API_DOMAIN ?? 'https://www.zohoapis.in';
 
-let zohoRefreshToken: string | null = null;
+let zohoRefreshToken: string | null = process.env.ZOHO_REFRESH_TOKEN ?? null;
+let zohoAccessToken: string | null = null;
+let zohoAccessTokenExpiry = 0;
 
 app.get('/auth/zoho/start', (_req: Request, res: Response) => {
   const params = new URLSearchParams({
@@ -1177,6 +1181,220 @@ app.get('/auth/zoho/callback', async (req: Request, res: Response) => {
     });
   }
 });
+
+// --- ZOHO BOOKS SYNC ---
+
+async function refreshZohoToken(): Promise<string> {
+  if (zohoAccessToken && Date.now() < zohoAccessTokenExpiry - 60_000) {
+    return zohoAccessToken;
+  }
+  if (!zohoRefreshToken) {
+    throw new Error('No Zoho refresh token. Set ZOHO_REFRESH_TOKEN env var or complete the /auth/zoho/start flow.');
+  }
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: ZOHO_CLIENT_ID,
+    client_secret: ZOHO_CLIENT_SECRET,
+    refresh_token: zohoRefreshToken,
+  });
+  const res = await fetch('https://accounts.zoho.in/oauth/v2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  const data = await res.json() as Record<string, unknown>;
+  if (!res.ok || data.error || typeof data.access_token !== 'string') {
+    throw new Error(`Zoho token refresh failed: ${JSON.stringify(data)}`);
+  }
+  zohoAccessToken = data.access_token;
+  zohoAccessTokenExpiry = Date.now() + Number(data.expires_in ?? 3600) * 1000;
+  return zohoAccessToken;
+}
+
+interface ZohoLineItem {
+  item_id: string;
+  item_name: string;
+  quantity: number;
+}
+
+interface ZohoInvoice {
+  invoice_id: string;
+  invoice_number: string;
+  customer_name: string;
+  customer_id: string;
+  due_date: string;
+  line_items: ZohoLineItem[];
+}
+
+async function zohoGet<T>(path: string, accessToken: string): Promise<T> {
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${ZOHO_API_DOMAIN}${path}${sep}organization_id=${ZOHO_ORG_ID}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const data = await res.json() as any;
+  if (!res.ok || (data.code !== undefined && data.code !== 0)) {
+    throw new Error(`Zoho API error (${res.status}): ${JSON.stringify(data)}`);
+  }
+  return data as T;
+}
+
+async function fetchAllZohoInvoices(accessToken: string): Promise<ZohoInvoice[]> {
+  const all: ZohoInvoice[] = [];
+  let page = 1;
+  while (true) {
+    const data = await zohoGet<any>(`/books/v3/invoices?page=${page}&per_page=200`, accessToken);
+    const batch: ZohoInvoice[] = data.invoices ?? [];
+    all.push(...batch);
+    if (!data.page_context?.has_more_page) break;
+    page++;
+  }
+  return all;
+}
+
+async function fetchZohoInvoiceDetail(invoiceId: string, accessToken: string): Promise<ZohoInvoice> {
+  const data = await zohoGet<any>(`/books/v3/invoices/${encodeURIComponent(invoiceId)}`, accessToken);
+  return data.invoice as ZohoInvoice;
+}
+
+async function findOrCreateCustomer(customerName: string, zohoCustomerId: string): Promise<string | null> {
+  try {
+    const rows = await supabaseRequest<any[]>('gg_customers?on_conflict=zoho_customer_id&select=id', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+      body: { name: customerName, zoho_customer_id: zohoCustomerId },
+    });
+    return rows.length > 0 ? String(rows[0].id) : null;
+  } catch {
+    try {
+      const byName = await supabaseRequest<any[]>(
+        `gg_customers?select=id&name=eq.${encodeURIComponent(customerName)}&limit=1`,
+      );
+      if (byName.length > 0) return String(byName[0].id);
+      const created = await supabaseRequest<any[]>('gg_customers?select=id', {
+        method: 'POST',
+        headers: { Prefer: 'return=representation' },
+        body: { name: customerName },
+      });
+      return created.length > 0 ? String(created[0].id) : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function findFlavorForItem(itemName: string): Promise<{ id: string; name: string } | null> {
+  const keyword = itemName.trim().split(/\s+/)[0];
+  const rows = await supabaseRequest<any[]>(
+    `gg_flavors?select=id,name&name=ilike.*${encodeURIComponent(keyword)}*&limit=1`,
+  );
+  return rows.length > 0 ? { id: String(rows[0].id), name: String(rows[0].name) } : null;
+}
+
+interface ZohoSyncResult {
+  synced: number;
+  skipped: number;
+  errors: string[];
+}
+
+async function syncZohoInvoices(): Promise<ZohoSyncResult> {
+  const result: ZohoSyncResult = { synced: 0, skipped: 0, errors: [] };
+
+  if (!SUPABASE_ENABLED) {
+    result.errors.push('Supabase not configured — sync aborted.');
+    return result;
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = await refreshZohoToken();
+  } catch (err) {
+    result.errors.push(`Token refresh: ${err instanceof Error ? err.message : String(err)}`);
+    return result;
+  }
+
+  let summaries: ZohoInvoice[];
+  try {
+    summaries = await fetchAllZohoInvoices(accessToken);
+  } catch (err) {
+    result.errors.push(`Invoice list: ${err instanceof Error ? err.message : String(err)}`);
+    return result;
+  }
+
+  for (const summary of summaries) {
+    try {
+      const existing = await supabaseRequest<any[]>(
+        `gg_invoices?select=id,is_dispatched&zoho_invoice_id=eq.${encodeURIComponent(summary.invoice_id)}&limit=1`,
+      );
+      if (existing.length > 0 && existing[0].is_dispatched === true) {
+        result.skipped++;
+        continue;
+      }
+
+      const invoice = await fetchZohoInvoiceDetail(summary.invoice_id, accessToken);
+      const customerId = await findOrCreateCustomer(invoice.customer_name, invoice.customer_id);
+
+      const items: Array<{
+        flavor_id: string | null;
+        flavor_name: string;
+        quantity_boxes: number;
+        quantity_units: number;
+      }> = [];
+
+      for (const line of invoice.line_items ?? []) {
+        const flavor = await findFlavorForItem(line.item_name);
+        items.push({
+          flavor_id: flavor?.id ?? null,
+          flavor_name: flavor?.name ?? line.item_name,
+          quantity_boxes: Math.round((line.quantity / 15) * 100) / 100,
+          quantity_units: line.quantity,
+        });
+      }
+
+      await supabaseRequest<void>('gg_invoices?on_conflict=zoho_invoice_id', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: {
+          invoice_number: invoice.invoice_number,
+          customer_name: invoice.customer_name,
+          customer_id: customerId,
+          items,
+          expected_dispatch_date: invoice.due_date || null,
+          zoho_invoice_id: invoice.invoice_id,
+        },
+      });
+
+      result.synced++;
+    } catch (err) {
+      const msg = `Invoice ${summary.invoice_id}: ${err instanceof Error ? err.message : String(err)}`;
+      console.error('[zoho-sync]', msg);
+      result.errors.push(msg);
+    }
+  }
+
+  console.log(`[zoho-sync] done — synced=${result.synced} skipped=${result.skipped} errors=${result.errors.length}`);
+  return result;
+}
+
+app.get('/sync/zoho', async (_req: Request, res: Response) => {
+  try {
+    const result = await syncZohoInvoices();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({
+      error: 'sync_failed',
+      message: err instanceof Error ? err.message : 'Unknown error during Zoho sync.',
+    });
+  }
+});
+
+// Runs only in long-lived environments (local dev). On Vercel serverless, use an external cron
+// hitting GET /sync/zoho every 5 minutes instead.
+if (!process.env.VERCEL) {
+  setInterval(() => {
+    syncZohoInvoices().catch((err) => console.error('[zoho-sync] interval error:', err));
+  }, 5 * 60 * 1000);
+}
 
 // Export the app for Vercel serverless runtime.
 // app.listen() is only called in local development (non-Vercel environments).
