@@ -516,21 +516,26 @@ async function fetchRecipeIdForSku(skuId: string): Promise<string | null> {
  * Tries `batch_size` column first, falls back to `yield_factor`.
  */
 async function fetchRecipeBatchSize(recipeId: string): Promise<number | null> {
+  // The web app stores the batch size in `batch_size_kg`. Older code looked
+  // for `batch_size` / `yield_factor` which don't exist — that silently
+  // disabled production deduction. Read batch_size_kg first.
   const rows = await supabaseRequest<any[]>(
-    `gg_recipes?select=id,batch_size,yield_factor&id=eq.${encodeURIComponent(recipeId)}&limit=1`,
+    `gg_recipes?select=id,batch_size_kg,batch_size,yield_factor&id=eq.${encodeURIComponent(recipeId)}&limit=1`,
   );
   if (rows.length === 0) return null;
   const row = rows[0];
-  const batchSize = Number(row.batch_size ?? row.yield_factor);
+  const batchSize = Number(row.batch_size_kg ?? row.batch_size ?? row.yield_factor);
   return Number.isFinite(batchSize) && batchSize > 0 ? batchSize : null;
 }
 
 /**
- * Returns all ingredient lines for a recipe from gg_recipe_lines.
+ * Returns all ingredient lines for a recipe from recipe_lines.
+ * (The table is `recipe_lines`, not `gg_recipe_lines` — the old name was a
+ * bug that made this always return nothing.)
  */
 async function fetchRecipeLines(recipeId: string): Promise<RecipeLineRow[]> {
   const rows = await supabaseRequest<any[]>(
-    `gg_recipe_lines?select=ingredient_id,qty&recipe_id=eq.${encodeURIComponent(recipeId)}`,
+    `recipe_lines?select=ingredient_id,qty&recipe_id=eq.${encodeURIComponent(recipeId)}`,
   );
   return rows
     .map((r) => ({ ingredient_id: String(r.ingredient_id), qty: Number(r.qty) }))
