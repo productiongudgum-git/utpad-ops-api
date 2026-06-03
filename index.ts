@@ -949,6 +949,65 @@ app.delete('/api/v1/ops/workers/:workerId', async (req: Request, res: Response) 
   }
 });
 
+// ─── Worker devices (FCM push tokens) ─────────────────────────────────────────
+// One row per (worker × device). Token is the unique key — re-registering the
+// same physical device just updates worker_id and last_seen_at. Logout calls
+// the DELETE endpoint so a logged-out device stops receiving pushes.
+
+app.post('/api/v1/ops/worker-devices', async (req: Request, res: Response) => {
+  const workerId = safeText(req.body?.worker_id, '');
+  const fcmToken = safeText(req.body?.fcm_token, '');
+  const platform = safeText(req.body?.platform, 'android');
+  if (!workerId || !fcmToken) {
+    res.status(400).json({ error: 'invalid_payload', message: 'worker_id and fcm_token are required.' });
+    return;
+  }
+  if (!SUPABASE_ENABLED) {
+    res.status(503).json({ error: 'supabase_disabled', message: 'Supabase is not configured.' });
+    return;
+  }
+  try {
+    const now = new Date().toISOString();
+    const stored = await supabaseRequest<any[]>('worker_devices?on_conflict=fcm_token', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+      body: [{ worker_id: workerId, fcm_token: fcmToken, platform, last_seen_at: now, updated_at: now }],
+    });
+    res.status(201).json(Array.isArray(stored) ? stored[0] ?? null : stored);
+  } catch (error) {
+    console.error('Worker device upsert failed.', error);
+    res.status(500).json({
+      error: 'worker_device_upsert_failed',
+      message: error instanceof Error ? error.message : 'Unable to register device token.',
+    });
+  }
+});
+
+app.delete('/api/v1/ops/worker-devices/:token', async (req: Request, res: Response) => {
+  const token = safeText(req.params.token, '');
+  if (!token) {
+    res.status(400).json({ error: 'invalid_token', message: 'token path parameter is required.' });
+    return;
+  }
+  if (!SUPABASE_ENABLED) {
+    res.status(503).json({ error: 'supabase_disabled', message: 'Supabase is not configured.' });
+    return;
+  }
+  try {
+    await supabaseRequest<any>(`worker_devices?fcm_token=eq.${encodeURIComponent(token)}`, {
+      method: 'DELETE',
+      headers: { Prefer: 'return=minimal' },
+    });
+    res.status(204).send();
+  } catch (error) {
+    console.error('Worker device deletion failed.', error);
+    res.status(500).json({
+      error: 'worker_device_delete_failed',
+      message: error instanceof Error ? error.message : 'Unable to deregister device token.',
+    });
+  }
+});
+
 app.patch('/api/v1/ops/workers/:workerId/active', async (req: Request, res: Response) => {
   const workerId = safeText(req.params.workerId, '');
   if (!workerId) {
