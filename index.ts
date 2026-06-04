@@ -1015,7 +1015,7 @@ app.delete('/api/v1/ops/worker-devices/:token', async (req: Request, res: Respon
 // approve time stay pending until stock is replenished.
 
 type FifoSplit = {
-  production_batch_id: string;
+  production_batch_id: string | null;
   batch_code: string;
   batch_number: number | null;
   session_date: string | null;
@@ -1023,26 +1023,31 @@ type FifoSplit = {
 };
 
 /**
- * Net available boxes per (flavor, production_batch). Returns batches sorted
- * by session_date ASC (oldest first) so FIFO walks them in order.
+ * Net available boxes per (flavor, batch_code/production_batch). Includes OPENING-STOCK
+ * rows where production_batch_id is null — those are seeded inventory and need to feed
+ * dispatch like any other packing row. Returns batches sorted by session_date ASC
+ * (oldest first) so FIFO consumes opening stock and earlier production batches first.
  */
 async function getFlavorBatchAvailability(flavorId: string): Promise<Array<{
-  production_batch_id: string;
+  production_batch_id: string | null;
   batch_code: string;
   batch_number: number | null;
   session_date: string;
   available: number;
 }>> {
-  // packed per (production_batch, session_date) — earliest session_date wins for FIFO
+  // packed per (production_batch_id OR batch_code if null), earliest session_date wins for FIFO
   const packed = await supabaseRequest<any[]>(
-    `packing_sessions?select=production_batch_id,batch_code,session_date,boxes_packed&flavor_id=eq.${flavorId}&production_batch_id=not.is.null&order=session_date.asc`,
+    `packing_sessions?select=production_batch_id,batch_code,session_date,boxes_packed&flavor_id=eq.${flavorId}&order=session_date.asc`,
   );
   // dispatched per batch_code (dispatch_events uses batch_code not production_batch_id)
   const dispatched = await supabaseRequest<any[]>(
     `dispatch_events?select=batch_code,boxes_dispatched&sku_id=eq.${flavorId}`,
   );
-  // Get batch_number for each production_batch_id via a single in-list lookup
-  const batchIds = Array.from(new Set(packed.map((p) => String(p.production_batch_id))));
+  // Get batch_number for production_batch_ids we have (skip nulls — OPENING-STOCK
+  // has no production_batches row).
+  const batchIds = Array.from(new Set(
+    packed.filter((p) => p.production_batch_id != null).map((p) => String(p.production_batch_id))
+  ));
   const batchInfo = batchIds.length === 0
     ? []
     : await supabaseRequest<any[]>(
@@ -1051,11 +1056,12 @@ async function getFlavorBatchAvailability(flavorId: string): Promise<Array<{
   const batchNumberById = new Map<string, number | null>();
   batchInfo.forEach((b: any) => batchNumberById.set(String(b.id), b.batch_number ?? null));
 
-  // Aggregate packed by production_batch_id; keep the earliest session_date.
-  const packedByBatch = new Map<string, { batch_code: string; session_date: string; packed: number }>();
+  // Aggregate packed by (production_batch_id OR batch_code-when-null); keep earliest session_date.
+  const packedByBatch = new Map<string, { production_batch_id: string | null; batch_code: string; session_date: string; packed: number }>();
   for (const row of packed) {
-    const pbId = String(row.production_batch_id);
-    const cur = packedByBatch.get(pbId);
+    const pbId = row.production_batch_id != null ? String(row.production_batch_id) : null;
+    const key = pbId ?? `code:${String(row.batch_code ?? '')}`;
+    const cur = packedByBatch.get(key);
     const boxes = Number(row.boxes_packed) || 0;
     const sessionDate = String(row.session_date ?? '');
     if (cur) {
@@ -1064,7 +1070,8 @@ async function getFlavorBatchAvailability(flavorId: string): Promise<Array<{
         cur.session_date = sessionDate;
       }
     } else {
-      packedByBatch.set(pbId, {
+      packedByBatch.set(key, {
+        production_batch_id: pbId,
         batch_code: String(row.batch_code ?? ''),
         session_date: sessionDate,
         packed: boxes,
@@ -1080,10 +1087,10 @@ async function getFlavorBatchAvailability(flavorId: string): Promise<Array<{
 
   // Reduce: per batch, available = packed - dispatched_for_that_batch_code
   // (dispatch_events doesn't track production_batch_id, so all dispatches against
-  // a batch_code are spread evenly across the production_batches under that code.
-  // Real-world batches rarely share a code so this collapses to packed-dispatched.)
+  // a batch_code are spread across the production_batches under that code.
+  // OPENING-STOCK rows have null production_batch_id and a synthetic key.)
   const result: Array<{
-    production_batch_id: string;
+    production_batch_id: string | null;
     batch_code: string;
     batch_number: number | null;
     session_date: string;
@@ -1091,10 +1098,10 @@ async function getFlavorBatchAvailability(flavorId: string): Promise<Array<{
   }> = [];
 
   // Group by batch_code so dispatched is subtracted from packed at the code level
-  const codeGroups = new Map<string, Array<{ id: string; session_date: string; packed: number }>>();
-  packedByBatch.forEach((v, pbId) => {
+  const codeGroups = new Map<string, Array<{ production_batch_id: string | null; session_date: string; packed: number }>>();
+  packedByBatch.forEach((v) => {
     const arr = codeGroups.get(v.batch_code) ?? [];
-    arr.push({ id: pbId, session_date: v.session_date, packed: v.packed });
+    arr.push({ production_batch_id: v.production_batch_id, session_date: v.session_date, packed: v.packed });
     codeGroups.set(v.batch_code, arr);
   });
 
@@ -1107,9 +1114,9 @@ async function getFlavorBatchAvailability(flavorId: string): Promise<Array<{
       remainingDispatched -= consumed;
       if (available > 0) {
         result.push({
-          production_batch_id: r.id,
+          production_batch_id: r.production_batch_id,
           batch_code: code,
-          batch_number: batchNumberById.get(r.id) ?? null,
+          batch_number: r.production_batch_id ? (batchNumberById.get(r.production_batch_id) ?? null) : null,
           session_date: r.session_date,
           available,
         });
