@@ -1008,6 +1008,504 @@ app.delete('/api/v1/ops/worker-devices/:token', async (req: Request, res: Respon
   }
 });
 
+// ─── D2C dispatch requests ────────────────────────────────────────────────────
+// Workers submit per-channel requests from mobile; admin reviews and approves
+// line-by-line on web. FIFO is computed at submit (preview) and recomputed at
+// approve time. Stock cannot go negative — lines that would push stock < 0 at
+// approve time stay pending until stock is replenished.
+
+type FifoSplit = {
+  production_batch_id: string;
+  batch_code: string;
+  batch_number: number | null;
+  session_date: string | null;
+  boxes: number;
+};
+
+/**
+ * Net available boxes per (flavor, production_batch). Returns batches sorted
+ * by session_date ASC (oldest first) so FIFO walks them in order.
+ */
+async function getFlavorBatchAvailability(flavorId: string): Promise<Array<{
+  production_batch_id: string;
+  batch_code: string;
+  batch_number: number | null;
+  session_date: string;
+  available: number;
+}>> {
+  // packed per (production_batch, session_date) — earliest session_date wins for FIFO
+  const packed = await supabaseRequest<any[]>(
+    `packing_sessions?select=production_batch_id,batch_code,session_date,boxes_packed&flavor_id=eq.${flavorId}&production_batch_id=not.is.null&order=session_date.asc`,
+  );
+  // dispatched per batch_code (dispatch_events uses batch_code not production_batch_id)
+  const dispatched = await supabaseRequest<any[]>(
+    `dispatch_events?select=batch_code,boxes_dispatched&sku_id=eq.${flavorId}`,
+  );
+  // Get batch_number for each production_batch_id via a single in-list lookup
+  const batchIds = Array.from(new Set(packed.map((p) => String(p.production_batch_id))));
+  const batchInfo = batchIds.length === 0
+    ? []
+    : await supabaseRequest<any[]>(
+        `production_batches?select=id,batch_number&id=in.(${batchIds.join(',')})`,
+      );
+  const batchNumberById = new Map<string, number | null>();
+  batchInfo.forEach((b: any) => batchNumberById.set(String(b.id), b.batch_number ?? null));
+
+  // Aggregate packed by production_batch_id; keep the earliest session_date.
+  const packedByBatch = new Map<string, { batch_code: string; session_date: string; packed: number }>();
+  for (const row of packed) {
+    const pbId = String(row.production_batch_id);
+    const cur = packedByBatch.get(pbId);
+    const boxes = Number(row.boxes_packed) || 0;
+    const sessionDate = String(row.session_date ?? '');
+    if (cur) {
+      cur.packed += boxes;
+      if (sessionDate && (!cur.session_date || sessionDate < cur.session_date)) {
+        cur.session_date = sessionDate;
+      }
+    } else {
+      packedByBatch.set(pbId, {
+        batch_code: String(row.batch_code ?? ''),
+        session_date: sessionDate,
+        packed: boxes,
+      });
+    }
+  }
+
+  const dispatchedByBatchCode = new Map<string, number>();
+  for (const row of dispatched) {
+    const code = String(row.batch_code ?? '');
+    dispatchedByBatchCode.set(code, (dispatchedByBatchCode.get(code) ?? 0) + (Number(row.boxes_dispatched) || 0));
+  }
+
+  // Reduce: per batch, available = packed - dispatched_for_that_batch_code
+  // (dispatch_events doesn't track production_batch_id, so all dispatches against
+  // a batch_code are spread evenly across the production_batches under that code.
+  // Real-world batches rarely share a code so this collapses to packed-dispatched.)
+  const result: Array<{
+    production_batch_id: string;
+    batch_code: string;
+    batch_number: number | null;
+    session_date: string;
+    available: number;
+  }> = [];
+
+  // Group by batch_code so dispatched is subtracted from packed at the code level
+  const codeGroups = new Map<string, Array<{ id: string; session_date: string; packed: number }>>();
+  packedByBatch.forEach((v, pbId) => {
+    const arr = codeGroups.get(v.batch_code) ?? [];
+    arr.push({ id: pbId, session_date: v.session_date, packed: v.packed });
+    codeGroups.set(v.batch_code, arr);
+  });
+
+  codeGroups.forEach((rows, code) => {
+    rows.sort((a, b) => a.session_date.localeCompare(b.session_date));
+    let remainingDispatched = dispatchedByBatchCode.get(code) ?? 0;
+    for (const r of rows) {
+      const consumed = Math.min(remainingDispatched, r.packed);
+      const available = r.packed - consumed;
+      remainingDispatched -= consumed;
+      if (available > 0) {
+        result.push({
+          production_batch_id: r.id,
+          batch_code: code,
+          batch_number: batchNumberById.get(r.id) ?? null,
+          session_date: r.session_date,
+          available,
+        });
+      }
+    }
+  });
+
+  // Final FIFO sort across all batches by session_date ASC.
+  result.sort((a, b) => a.session_date.localeCompare(b.session_date));
+  return result;
+}
+
+/** Compute FIFO split for a single flavor + box count. Returns splits + shortfall. */
+async function computeFifoForFlavor(
+  flavorId: string,
+  boxesRequested: number,
+): Promise<{ splits: FifoSplit[]; shortfall: number; totalAvailable: number }> {
+  const batches = await getFlavorBatchAvailability(flavorId);
+  const totalAvailable = batches.reduce((s, b) => s + b.available, 0);
+  const splits: FifoSplit[] = [];
+  let remaining = boxesRequested;
+  for (const b of batches) {
+    if (remaining <= 0) break;
+    const take = Math.min(b.available, remaining);
+    if (take > 0) {
+      splits.push({
+        production_batch_id: b.production_batch_id,
+        batch_code: b.batch_code,
+        batch_number: b.batch_number,
+        session_date: b.session_date || null,
+        boxes: take,
+      });
+      remaining -= take;
+    }
+  }
+  return { splits, shortfall: Math.max(0, remaining), totalAvailable };
+}
+
+/** Per-flavour finished-goods available — used by mobile picker + web pending tab. */
+app.get('/api/v1/ops/finished-goods-available', async (_req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) {
+    res.status(503).json({ error: 'supabase_disabled' });
+    return;
+  }
+  try {
+    const flavors = await supabaseRequest<any[]>('gg_flavors?select=id,name&active=eq.true&order=name.asc');
+    const packed = await supabaseRequest<any[]>('packing_sessions?select=flavor_id,boxes_packed&limit=100000');
+    const dispatched = await supabaseRequest<any[]>('dispatch_events?select=sku_id,boxes_dispatched&limit=100000');
+
+    const packedBy = new Map<string, number>();
+    packed.forEach((r: any) => {
+      const k = String(r.flavor_id);
+      packedBy.set(k, (packedBy.get(k) ?? 0) + (Number(r.boxes_packed) || 0));
+    });
+    const dispatchedBy = new Map<string, number>();
+    dispatched.forEach((r: any) => {
+      const k = String(r.sku_id);
+      dispatchedBy.set(k, (dispatchedBy.get(k) ?? 0) + (Number(r.boxes_dispatched) || 0));
+    });
+
+    const rows = flavors.map((f: any) => ({
+      flavor_id: f.id,
+      flavor_name: f.name,
+      boxes_available: (packedBy.get(f.id) ?? 0) - (dispatchedBy.get(f.id) ?? 0),
+    }));
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: 'finished_goods_failed', message: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Distinct channel names — existing allocations + this table. */
+app.get('/api/v1/ops/d2c-channels', async (_req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) {
+    res.status(503).json({ error: 'supabase_disabled' });
+    return;
+  }
+  try {
+    const allocations = await supabaseRequest<any[]>('gg_d2c_allocations?select=channel_name&limit=10000');
+    const requests = await supabaseRequest<any[]>('d2c_dispatch_requests?select=channel&limit=10000');
+    const set = new Set<string>();
+    allocations.forEach((r: any) => { if (r.channel_name) set.add(String(r.channel_name)); });
+    requests.forEach((r: any) => { if (r.channel) set.add(String(r.channel)); });
+    // Seed common channels even if nothing's been used yet
+    ['Shopify', 'Amazon', 'Swiggy', 'Zepto', 'Blinkit'].forEach((c) => set.add(c));
+    res.json(Array.from(set).sort());
+  } catch (error) {
+    res.status(500).json({ error: 'channels_failed', message: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Create a new D2C dispatch request. Validates stock at submit; computes FIFO preview. */
+app.post('/api/v1/ops/d2c-requests', async (req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) {
+    res.status(503).json({ error: 'supabase_disabled' });
+    return;
+  }
+  const channel = safeText(req.body?.channel, '').trim();
+  const workerId = safeText(req.body?.worker_id, '').trim();
+  const notes = safeText(req.body?.notes, '');
+  const items: Array<{ flavor_id: string; boxes: number }> = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  if (!channel || !workerId || items.length === 0) {
+    res.status(400).json({ error: 'invalid_payload', message: 'channel, worker_id, and items[] are required.' });
+    return;
+  }
+
+  // Validate stock + compute FIFO per item
+  try {
+    const itemDetails: Array<{ flavor_id: string; boxes: number; splits: FifoSplit[] }> = [];
+    const insufficient: Array<{ flavor_id: string; requested: number; available: number }> = [];
+    for (const it of items) {
+      const boxes = Math.floor(Number(it.boxes) || 0);
+      if (!it.flavor_id || boxes <= 0) {
+        res.status(400).json({ error: 'invalid_item', message: 'Each item needs flavor_id and boxes > 0.' });
+        return;
+      }
+      const { splits, shortfall, totalAvailable } = await computeFifoForFlavor(String(it.flavor_id), boxes);
+      if (shortfall > 0) {
+        insufficient.push({ flavor_id: it.flavor_id, requested: boxes, available: totalAvailable });
+        continue;
+      }
+      itemDetails.push({ flavor_id: it.flavor_id, boxes, splits });
+    }
+    if (insufficient.length > 0) {
+      res.status(409).json({ error: 'insufficient_stock', insufficient });
+      return;
+    }
+
+    // Insert header
+    const headerRows = await supabaseRequest<any[]>('d2c_dispatch_requests', {
+      method: 'POST',
+      headers: { Prefer: 'return=representation' },
+      body: [{ channel, worker_id: workerId, notes, header_status: 'pending' }],
+    });
+    const requestId = headerRows?.[0]?.id;
+    if (!requestId) throw new Error('Header insert returned no id');
+
+    // Insert items
+    const itemRows = itemDetails.map((d) => ({
+      request_id: requestId,
+      flavor_id: d.flavor_id,
+      boxes_requested: d.boxes,
+      status: 'pending',
+      batch_breakdown: d.splits,
+    }));
+    await supabaseRequest<any[]>('d2c_dispatch_request_items', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: itemRows,
+    });
+
+    res.status(201).json({ id: requestId, channel, worker_id: workerId, items: itemDetails });
+  } catch (error) {
+    console.error('D2C request create failed.', error);
+    res.status(500).json({ error: 'd2c_request_create_failed', message: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** List D2C requests, filterable by worker_id, channel, status. */
+app.get('/api/v1/ops/d2c-requests', async (req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) {
+    res.status(503).json({ error: 'supabase_disabled' });
+    return;
+  }
+  try {
+    const conds: string[] = [];
+    if (req.query.worker_id) conds.push(`worker_id=eq.${encodeURIComponent(String(req.query.worker_id))}`);
+    if (req.query.channel)   conds.push(`channel=eq.${encodeURIComponent(String(req.query.channel))}`);
+    if (req.query.status)    conds.push(`header_status=eq.${encodeURIComponent(String(req.query.status))}`);
+    const qs = conds.length > 0 ? '&' + conds.join('&') : '';
+    const rows = await supabaseRequest<any[]>(
+      `d2c_dispatch_requests?select=id,channel,worker_id,header_status,notes,created_at,updated_at,items:d2c_dispatch_request_items(id,flavor_id,boxes_requested,status,batch_breakdown,approved_by,decided_at)&order=created_at.desc${qs}`,
+    );
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: 'd2c_request_list_failed', message: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Single request detail. */
+app.get('/api/v1/ops/d2c-requests/:id', async (req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) { res.status(503).json({ error: 'supabase_disabled' }); return; }
+  try {
+    const rows = await supabaseRequest<any[]>(
+      `d2c_dispatch_requests?id=eq.${encodeURIComponent(req.params.id)}&select=id,channel,worker_id,header_status,notes,created_at,updated_at,items:d2c_dispatch_request_items(id,flavor_id,boxes_requested,status,batch_breakdown,approved_by,decided_at,allocation_id)&limit=1`,
+    );
+    if (!rows || rows.length === 0) {
+      res.status(404).json({ error: 'request_not_found' });
+      return;
+    }
+    res.json(rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: 'd2c_request_detail_failed', message: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Worker edit: replace channel + replace items (only pending lines actually mutated). */
+app.patch('/api/v1/ops/d2c-requests/:id', async (req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) { res.status(503).json({ error: 'supabase_disabled' }); return; }
+  const requestId = req.params.id;
+  const channel = safeText(req.body?.channel, '').trim();
+  const items: Array<{ flavor_id: string; boxes: number }> = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!channel || items.length === 0) {
+    res.status(400).json({ error: 'invalid_payload' });
+    return;
+  }
+  try {
+    // Validate every line has stock available at edit time
+    const itemDetails: Array<{ flavor_id: string; boxes: number; splits: FifoSplit[] }> = [];
+    for (const it of items) {
+      const boxes = Math.floor(Number(it.boxes) || 0);
+      if (!it.flavor_id || boxes <= 0) {
+        res.status(400).json({ error: 'invalid_item' });
+        return;
+      }
+      const { splits, shortfall, totalAvailable } = await computeFifoForFlavor(String(it.flavor_id), boxes);
+      if (shortfall > 0) {
+        res.status(409).json({ error: 'insufficient_stock', flavor_id: it.flavor_id, requested: boxes, available: totalAvailable });
+        return;
+      }
+      itemDetails.push({ flavor_id: it.flavor_id, boxes, splits });
+    }
+
+    // Update header channel
+    await supabaseRequest<any[]>(`d2c_dispatch_requests?id=eq.${encodeURIComponent(requestId)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: { channel, updated_at: new Date().toISOString() },
+    });
+
+    // Delete existing pending items (already-decided lines stay).
+    await supabaseRequest<any[]>(
+      `d2c_dispatch_request_items?request_id=eq.${encodeURIComponent(requestId)}&status=eq.pending`,
+      { method: 'DELETE', headers: { Prefer: 'return=minimal' } },
+    );
+
+    // Insert fresh pending items
+    const itemRows = itemDetails.map((d) => ({
+      request_id: requestId,
+      flavor_id: d.flavor_id,
+      boxes_requested: d.boxes,
+      status: 'pending',
+      batch_breakdown: d.splits,
+    }));
+    await supabaseRequest<any[]>('d2c_dispatch_request_items', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: itemRows,
+    });
+
+    res.json({ id: requestId, updated: true });
+  } catch (error) {
+    res.status(500).json({ error: 'd2c_request_edit_failed', message: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Worker cancel — sets all pending items to cancelled. Already-decided lines stay. */
+app.delete('/api/v1/ops/d2c-requests/:id', async (req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) { res.status(503).json({ error: 'supabase_disabled' }); return; }
+  try {
+    await supabaseRequest<any[]>(
+      `d2c_dispatch_request_items?request_id=eq.${encodeURIComponent(req.params.id)}&status=eq.pending`,
+      {
+        method: 'PATCH',
+        headers: { Prefer: 'return=minimal' },
+        body: { status: 'cancelled', decided_at: new Date().toISOString() },
+      },
+    );
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: 'd2c_request_cancel_failed', message: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Admin per-line decide. Body: { decisions: [{item_id, action: 'approve'|'reject'}], approved_by: '<email>' } */
+app.post('/api/v1/ops/d2c-requests/:id/decide', async (req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) { res.status(503).json({ error: 'supabase_disabled' }); return; }
+  const decisions: Array<{ item_id: string; action: 'approve' | 'reject' }> = Array.isArray(req.body?.decisions) ? req.body.decisions : [];
+  const approvedBy = safeText(req.body?.approved_by, 'web_admin').trim();
+  if (decisions.length === 0) {
+    res.status(400).json({ error: 'no_decisions' });
+    return;
+  }
+
+  const requestId = req.params.id;
+  // Read the request header to get channel + worker_id (for allocation rows)
+  const headerRows = await supabaseRequest<any[]>(
+    `d2c_dispatch_requests?id=eq.${encodeURIComponent(requestId)}&select=channel,worker_id&limit=1`,
+  );
+  if (!headerRows || headerRows.length === 0) {
+    res.status(404).json({ error: 'request_not_found' });
+    return;
+  }
+  const channel  = String(headerRows[0].channel);
+  const workerId = String(headerRows[0].worker_id);
+
+  const results: Array<{ item_id: string; action: string; status: 'ok' | 'insufficient'; detail?: any }> = [];
+
+  for (const d of decisions) {
+    try {
+      // Pull the item
+      const itemRows = await supabaseRequest<any[]>(
+        `d2c_dispatch_request_items?id=eq.${encodeURIComponent(d.item_id)}&select=id,flavor_id,boxes_requested,status&limit=1`,
+      );
+      const item = itemRows?.[0];
+      if (!item) { results.push({ item_id: d.item_id, action: d.action, status: 'ok', detail: 'not_found' }); continue; }
+      if (item.status !== 'pending') {
+        results.push({ item_id: d.item_id, action: d.action, status: 'ok', detail: `already_${item.status}` });
+        continue;
+      }
+
+      if (d.action === 'reject') {
+        await supabaseRequest<any[]>(
+          `d2c_dispatch_request_items?id=eq.${encodeURIComponent(item.id)}`,
+          {
+            method: 'PATCH',
+            headers: { Prefer: 'return=minimal' },
+            body: { status: 'rejected', approved_by: approvedBy, decided_at: new Date().toISOString() },
+          },
+        );
+        results.push({ item_id: d.item_id, action: d.action, status: 'ok' });
+        continue;
+      }
+
+      // approve: recompute FIFO + check stock
+      const fifo = await computeFifoForFlavor(String(item.flavor_id), Number(item.boxes_requested));
+      if (fifo.shortfall > 0) {
+        results.push({
+          item_id: d.item_id, action: d.action, status: 'insufficient',
+          detail: { requested: item.boxes_requested, available: fifo.totalAvailable },
+        });
+        continue;
+      }
+
+      // Look up flavor_name for the allocation row (existing schema requires it)
+      const flavorRows = await supabaseRequest<any[]>(
+        `gg_flavors?select=name&id=eq.${encodeURIComponent(item.flavor_id)}&limit=1`,
+      );
+      const flavorName = String(flavorRows?.[0]?.name ?? '');
+
+      // Insert gg_d2c_allocations row (existing schema + new traceability cols)
+      const allocRows = await supabaseRequest<any[]>('gg_d2c_allocations', {
+        method: 'POST',
+        headers: { Prefer: 'return=representation' },
+        body: [{
+          channel_name: channel,
+          flavor_id: item.flavor_id,
+          flavor_name: flavorName,
+          boxes_allocated: item.boxes_requested,
+          source_request_item_id: item.id,
+          requested_by_worker_id: workerId,
+        }],
+      });
+      const allocationId = allocRows?.[0]?.id;
+
+      // Insert dispatch_events per FIFO split (one row per batch)
+      const dispatchRows = fifo.splits.map((s) => ({
+        batch_code: s.batch_code,
+        sku_id: item.flavor_id,
+        boxes_dispatched: s.boxes,
+        dispatch_date: new Date().toISOString().slice(0, 10),
+        customer_name: `D2C — ${channel}`,
+      }));
+      if (dispatchRows.length > 0) {
+        await supabaseRequest<any[]>('dispatch_events', {
+          method: 'POST',
+          headers: { Prefer: 'return=minimal' },
+          body: dispatchRows,
+        });
+      }
+
+      // Flip item to approved
+      await supabaseRequest<any[]>(
+        `d2c_dispatch_request_items?id=eq.${encodeURIComponent(item.id)}`,
+        {
+          method: 'PATCH',
+          headers: { Prefer: 'return=minimal' },
+          body: {
+            status: 'approved',
+            approved_by: approvedBy,
+            decided_at: new Date().toISOString(),
+            allocation_id: allocationId,
+          },
+        },
+      );
+      results.push({ item_id: d.item_id, action: d.action, status: 'ok' });
+    } catch (error) {
+      console.error('Decide line failed.', error);
+      results.push({ item_id: d.item_id, action: d.action, status: 'ok', detail: { error: error instanceof Error ? error.message : String(error) } });
+    }
+  }
+
+  res.json({ request_id: requestId, results });
+});
+
 app.patch('/api/v1/ops/workers/:workerId/active', async (req: Request, res: Response) => {
   const workerId = safeText(req.params.workerId, '');
   if (!workerId) {
