@@ -1473,13 +1473,17 @@ app.post('/api/v1/ops/d2c-requests/:id/decide', async (req: Request, res: Respon
       });
       const allocationId = allocRows?.[0]?.id;
 
-      // Insert dispatch_events per FIFO split (one row per batch)
+      // Insert dispatch_events per FIFO split (one row per batch).
+      // is_dispatched: true because admin approval IS the dispatch — D2C has no parent
+      // invoice to flip the flag on, so we must set it on the event itself or the
+      // inventory page would classify it as Reserved (not Dispatched).
       const dispatchRows = fifo.splits.map((s) => ({
         batch_code: s.batch_code,
         sku_id: item.flavor_id,
         boxes_dispatched: s.boxes,
         dispatch_date: new Date().toISOString().slice(0, 10),
         customer_name: `D2C — ${channel}`,
+        is_dispatched: true,
       }));
       if (dispatchRows.length > 0) {
         await supabaseRequest<any[]>('dispatch_events', {
