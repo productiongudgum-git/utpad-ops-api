@@ -1208,7 +1208,124 @@ app.get('/api/v1/ops/d2c-channels', async (_req: Request, res: Response) => {
   }
 });
 
-/** Create a new D2C dispatch request. Validates stock at submit; computes FIFO preview. */
+/**
+ * Approves a single pending D2C request item — recomputes FIFO, checks stock,
+ * inserts allocation + dispatch_events rows, flips the item's status to 'approved'.
+ * Extracted from POST /d2c-requests/:id/decide so the create endpoint can use it
+ * inline for auto-approved channels (Shopify).
+ */
+async function approveD2CRequestItem(
+  itemId: string,
+  opts: { channel: string; workerId: string; approvedBy: string },
+): Promise<{ item_id: string; action: 'approve'; status: 'ok' | 'insufficient' | 'not_found' | 'already_decided'; detail?: any }> {
+  try {
+    const itemRows = await supabaseRequest<any[]>(
+      `d2c_dispatch_request_items?id=eq.${encodeURIComponent(itemId)}&select=id,flavor_id,boxes_requested,status&limit=1`,
+    );
+    const item = itemRows?.[0];
+    if (!item) return { item_id: itemId, action: 'approve', status: 'not_found' };
+    if (item.status !== 'pending') return { item_id: itemId, action: 'approve', status: 'already_decided', detail: item.status };
+
+    const fifo = await computeFifoForFlavor(String(item.flavor_id), Number(item.boxes_requested));
+    if (fifo.shortfall > 0) {
+      return {
+        item_id: itemId, action: 'approve', status: 'insufficient',
+        detail: { requested: item.boxes_requested, available: fifo.totalAvailable },
+      };
+    }
+
+    const flavorRows = await supabaseRequest<any[]>(
+      `gg_flavors?select=name&id=eq.${encodeURIComponent(item.flavor_id)}&limit=1`,
+    );
+    const flavorName = String(flavorRows?.[0]?.name ?? '');
+
+    const allocRows = await supabaseRequest<any[]>('gg_d2c_allocations', {
+      method: 'POST',
+      headers: { Prefer: 'return=representation' },
+      body: [{
+        channel_name: opts.channel,
+        flavor_id: item.flavor_id,
+        flavor_name: flavorName,
+        boxes_allocated: item.boxes_requested,
+        source_request_item_id: item.id,
+        requested_by_worker_id: opts.workerId,
+      }],
+    });
+    const allocationId = allocRows?.[0]?.id;
+
+    const dispatchRows = fifo.splits.map((s) => ({
+      batch_code: s.batch_code,
+      sku_id: item.flavor_id,
+      boxes_dispatched: s.boxes,
+      dispatch_date: new Date().toISOString().slice(0, 10),
+      customer_name: `D2C — ${opts.channel}`,
+      is_dispatched: true,
+    }));
+    if (dispatchRows.length > 0) {
+      await supabaseRequest<any[]>('dispatch_events', {
+        method: 'POST',
+        headers: { Prefer: 'return=minimal' },
+        body: dispatchRows,
+      });
+    }
+
+    await supabaseRequest<any[]>(
+      `d2c_dispatch_request_items?id=eq.${encodeURIComponent(item.id)}`,
+      {
+        method: 'PATCH',
+        headers: { Prefer: 'return=minimal' },
+        body: {
+          status: 'approved',
+          approved_by: opts.approvedBy,
+          decided_at: new Date().toISOString(),
+          allocation_id: allocationId,
+        },
+      },
+    );
+    return { item_id: itemId, action: 'approve', status: 'ok' };
+  } catch (error) {
+    console.error('approveD2CRequestItem failed', error);
+    return { item_id: itemId, action: 'approve', status: 'ok', detail: { error: error instanceof Error ? error.message : String(error) } };
+  }
+}
+
+/** Case-insensitive check for the Shopify auto-approve rule. */
+function isShopifyAutoApprove(channel: string): boolean {
+  return /^shopify$/i.test(channel.trim());
+}
+
+/**
+ * One-shot backfill — approves every currently-pending item on any Shopify
+ * request. Idempotent (items already decided are skipped). Call once after
+ * deploying the Shopify auto-approve change so pre-existing pending requests
+ * don't sit there orphaned. Safe to call again anytime.
+ */
+app.post('/api/v1/ops/d2c-requests/backfill-shopify-auto-approve', async (_req: Request, res: Response) => {
+  if (!SUPABASE_ENABLED) { res.status(503).json({ error: 'supabase_disabled' }); return; }
+  try {
+    // Find pending items on Shopify requests. PostgREST supports embedded filters.
+    const rows = await supabaseRequest<any[]>(
+      `d2c_dispatch_request_items?status=eq.pending&select=id,request:d2c_dispatch_requests!inner(channel,worker_id)`
+    );
+    const results: any[] = [];
+    for (const r of (rows ?? [])) {
+      const channel  = String(r?.request?.channel ?? '');
+      const workerId = String(r?.request?.worker_id ?? '');
+      if (!isShopifyAutoApprove(channel)) continue;
+      const result = await approveD2CRequestItem(String(r.id), {
+        channel, workerId, approvedBy: `auto:backfill:${channel.toLowerCase()}`,
+      });
+      results.push(result);
+    }
+    res.json({ scanned: rows?.length ?? 0, approved: results.filter((x: any) => x.status === 'ok').length, results });
+  } catch (error) {
+    console.error('Shopify auto-approve backfill failed', error);
+    res.status(500).json({ error: 'backfill_failed', message: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Create a new D2C dispatch request. Validates stock at submit; computes FIFO preview.
+ *  Shopify requests skip the pending state and auto-approve inline. */
 app.post('/api/v1/ops/d2c-requests', async (req: Request, res: Response) => {
   if (!SUPABASE_ENABLED) {
     res.status(503).json({ error: 'supabase_disabled' });
@@ -1255,7 +1372,7 @@ app.post('/api/v1/ops/d2c-requests', async (req: Request, res: Response) => {
     const requestId = headerRows?.[0]?.id;
     if (!requestId) throw new Error('Header insert returned no id');
 
-    // Insert items
+    // Insert items — return the new item ids so we can auto-approve when applicable.
     const itemRows = itemDetails.map((d) => ({
       request_id: requestId,
       flavor_id: d.flavor_id,
@@ -1263,13 +1380,35 @@ app.post('/api/v1/ops/d2c-requests', async (req: Request, res: Response) => {
       status: 'pending',
       batch_breakdown: d.splits,
     }));
-    await supabaseRequest<any[]>('d2c_dispatch_request_items', {
+    const insertedItems = await supabaseRequest<any[]>('d2c_dispatch_request_items', {
       method: 'POST',
-      headers: { Prefer: 'return=minimal' },
+      headers: { Prefer: 'return=representation' },
       body: itemRows,
     });
 
-    res.status(201).json({ id: requestId, channel, worker_id: workerId, items: itemDetails });
+    // Auto-approve inline for Shopify. Every item gets FIFO-recomputed + allocation
+    // + dispatch_events + status flipped to 'approved'.  Any that hit insufficient
+    // stock at approval time stay pending (same rule as admin approve).
+    let autoApprovalResults: any[] = [];
+    if (isShopifyAutoApprove(channel)) {
+      for (const created of (insertedItems ?? [])) {
+        if (created?.id) {
+          const r = await approveD2CRequestItem(String(created.id), {
+            channel, workerId, approvedBy: `auto:${channel.toLowerCase()}`,
+          });
+          autoApprovalResults.push(r);
+        }
+      }
+    }
+
+    res.status(201).json({
+      id: requestId,
+      channel,
+      worker_id: workerId,
+      items: itemDetails,
+      auto_approved: isShopifyAutoApprove(channel),
+      auto_approval_results: autoApprovalResults,
+    });
   } catch (error) {
     console.error('D2C request create failed.', error);
     res.status(500).json({ error: 'd2c_request_create_failed', message: error instanceof Error ? error.message : String(error) });
