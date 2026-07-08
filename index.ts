@@ -1,13 +1,21 @@
 import * as dotenv from 'dotenv';
 import cors from 'cors';
 import express, { Request, Response } from 'express';
+import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
+import ExcelJS from 'exceljs';
+import pdfParse from 'pdf-parse';
 
 dotenv.config({ quiet: true });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 35 * 1024 * 1024, files: 12 },
+});
 
 const SUPABASE_URL = process.env.SUPABASE_URL ?? 'https://zoemonbualktnxhpbebv.supabase.co';
 const SUPABASE_PROJECT_REF = process.env.SUPABASE_PROJECT_REF ?? 'zoemonbualktnxhpbebv';
@@ -1441,7 +1449,7 @@ app.get('/api/v1/ops/d2c-requests/:id', async (req: Request, res: Response) => {
   if (!SUPABASE_ENABLED) { res.status(503).json({ error: 'supabase_disabled' }); return; }
   try {
     const rows = await supabaseRequest<any[]>(
-      `d2c_dispatch_requests?id=eq.${encodeURIComponent(req.params.id)}&select=id,channel,worker_id,header_status,notes,created_at,updated_at,items:d2c_dispatch_request_items(id,flavor_id,boxes_requested,status,batch_breakdown,approved_by,decided_at,allocation_id)&limit=1`,
+      `d2c_dispatch_requests?id=eq.${encodeURIComponent(String(req.params.id))}&select=id,channel,worker_id,header_status,notes,created_at,updated_at,items:d2c_dispatch_request_items(id,flavor_id,boxes_requested,status,batch_breakdown,approved_by,decided_at,allocation_id)&limit=1`,
     );
     if (!rows || rows.length === 0) {
       res.status(404).json({ error: 'request_not_found' });
@@ -1456,7 +1464,7 @@ app.get('/api/v1/ops/d2c-requests/:id', async (req: Request, res: Response) => {
 /** Worker edit: replace channel + replace items (only pending lines actually mutated). */
 app.patch('/api/v1/ops/d2c-requests/:id', async (req: Request, res: Response) => {
   if (!SUPABASE_ENABLED) { res.status(503).json({ error: 'supabase_disabled' }); return; }
-  const requestId = req.params.id;
+  const requestId = String(req.params.id);
   const channel = safeText(req.body?.channel, '').trim();
   const items: Array<{ flavor_id: string; boxes: number }> = Array.isArray(req.body?.items) ? req.body.items : [];
   if (!channel || items.length === 0) {
@@ -1518,7 +1526,7 @@ app.delete('/api/v1/ops/d2c-requests/:id', async (req: Request, res: Response) =
   if (!SUPABASE_ENABLED) { res.status(503).json({ error: 'supabase_disabled' }); return; }
   try {
     await supabaseRequest<any[]>(
-      `d2c_dispatch_request_items?request_id=eq.${encodeURIComponent(req.params.id)}&status=eq.pending`,
+      `d2c_dispatch_request_items?request_id=eq.${encodeURIComponent(String(req.params.id))}&status=eq.pending`,
       {
         method: 'PATCH',
         headers: { Prefer: 'return=minimal' },
@@ -1541,7 +1549,7 @@ app.post('/api/v1/ops/d2c-requests/:id/decide', async (req: Request, res: Respon
     return;
   }
 
-  const requestId = req.params.id;
+  const requestId = String(req.params.id);
   // Read the request header to get channel + worker_id (for allocation rows)
   const headerRows = await supabaseRequest<any[]>(
     `d2c_dispatch_requests?id=eq.${encodeURIComponent(requestId)}&select=channel,worker_id&limit=1`,
@@ -1830,6 +1838,742 @@ app.post('/api/v1/auth/sync/events', (req: Request, res: Response) => {
   res.json({ syncedCount: req.body.events?.length || 0, conflicts: [] });
 });
 
+// --- COURIER ANALYSIS ---
+
+type CourierFileType =
+  | 'DTDC invoice PDF'
+  | 'DTDC tracking/reference'
+  | 'BlueDart invoice'
+  | 'Shopify D2C export'
+  | 'Zoho invoice export'
+  | 'Delivery Challan export'
+  | 'Pincode master'
+  | 'Unknown';
+
+interface UploadedCourierFile {
+  filename: string;
+  type: CourierFileType;
+  buffer: Buffer;
+  mimetype: string;
+}
+
+interface CourierShipmentRow {
+  courier: 'DTDC' | 'BlueDart';
+  month: string;
+  cn: string;
+  date: string;
+  ref: string;
+  destination: string;
+  pincode: string;
+  category: string;
+  service: string;
+  zone: string;
+  sales: number;
+  weight: number;
+  actualWeight: number;
+  ourWeight: number;
+  billedSlab: number;
+  ourSlab: number;
+  weightType: 'Type A' | 'Type B' | 'Type C';
+  total: number;
+  expectedCharge: number;
+  rateDifference: number;
+  overcharge: number;
+  unmatched: boolean;
+  referenceMatch: 'Matched' | 'Not matched' | 'Skipped';
+  referenceIssue: string;
+}
+
+interface CourierReportSummary {
+  courier: 'DTDC' | 'BlueDart';
+  month: string;
+  shipments: number;
+  d2cDeliveryPct: number;
+  retailDeliveryPct: number;
+  totalOvercharge: number;
+  unmatched: number;
+  referenceIssues: number;
+  typeA: number;
+  typeB: number;
+  typeC: number;
+  disputeFile: string;
+  summaryFile: string;
+}
+
+const COURIER_BUCKET = process.env.COURIER_ANALYSIS_BUCKET ?? 'courier-analysis';
+const courierFallbackRuns: any[] = [];
+const courierFallbackFiles = new Map<string, { buffer: Buffer; contentType: string; filename: string }>();
+
+const COURIER_SAMPLE_KEYWORDS = ['SAMPLE','REPLACE','MAHADEV','DRMONIKA','PLUM','ADITYA','FOODSMITH','RASIK','LILFLEA','MIRAL','LOKAS','DYUTHIS','KARANREP','KUSH','GUDPOPS','QUIVER','KKN','SHRUTHI','DEEPMALA','SWAYAM','BABYTALK','ISHAL','SURAJ','ARHHAM'];
+const COURIER_ZONE_MAP: Record<string, string> = {'Local':'City','Regional':'Region','Zone':'Zone','Metro':'Metro','Rest of India':'RoI-B','North East':'RoI-B','Spl Dest':'Spl Dest.','SPl Dest':'Spl Dest.','Spl Dest.':'Spl Dest.'};
+const DTDC_PRIORITY: Record<string, [number, number]> = {'City':[33,19],'Region':[39,21],'Zone':[46,27],'Metro':[63,48],'RoI-B':[68,57],'Spl Dest.':[78,70]};
+const DTDC_SURFACE: Record<string, [number, number, number]> = {'City':[30,18,29],'Region':[34,21,36],'Zone':[39,23,40],'Metro':[45,33,65],'RoI-B':[54,40,75],'Spl Dest.':[59,50,90]};
+
+function courierMoney(value: unknown): number {
+  const parsed = Number(String(value ?? '').replace(/[,₹]/g, '').trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function courierNormRef(value: unknown): string {
+  return String(value ?? '').replace(/[\n\r]/g, '').trim().replace(/^\.+/, '').replace(/\s+/g, '');
+}
+
+function courierNormInv(value: unknown): string {
+  const ref = courierNormRef(value).toUpperCase();
+  const match = ref.match(/^INV-?(\d{2})-(\d{2})-(\d+)(R?)$/);
+  return match ? `INV${match[1]}-${match[2]}/${match[3]}${match[4]}` : ref;
+}
+
+function courierSlab(weightKg: number): number {
+  return Math.max(1, Math.ceil(Math.max(Number(weightKg) || 0.001, 0.001) / 0.5));
+}
+
+function courierClassify(ref: string, awb = ''): string {
+  const raw = courierNormRef(ref);
+  const upper = raw.toUpperCase();
+  const awbUpper = String(awb || '').toUpperCase();
+  if (!upper || upper === '0') return awbUpper.endsWith('R') ? 'Return' : 'Unknown';
+  if (COURIER_SAMPLE_KEYWORDS.some((k) => upper.includes(k))) return 'Sample';
+  if (upper.startsWith('SHP/') && (upper.endsWith('-R') || upper.endsWith('R'))) return 'Return-D2C';
+  if (/^#?GG\d+R$/.test(upper)) return 'Return-D2C';
+  if (upper.startsWith('INV') && upper.endsWith('R')) return 'Return-Retail';
+  if (upper.startsWith('DC-') && upper.endsWith('R')) return 'Return-Retail';
+  if (upper.startsWith('SHP/') || /^#?GG\d+$/.test(upper)) return 'D2C';
+  if (upper.startsWith('INV')) return 'Retail';
+  if (upper.startsWith('DC-')) return 'Retail-DC';
+  if (/^(7D|7X|I\d|E\d)/.test(upper) || /^\d{7,}$/.test(upper)) return 'Return';
+  return 'Other';
+}
+
+function dtdcServiceFromCn(cn: string): string {
+  const ref = courierNormRef(cn).toUpperCase();
+  if (ref.startsWith('7D')) return 'Surface';
+  if (ref.startsWith('7X')) return 'Priority';
+  return 'Unknown';
+}
+
+function blueServiceFromProduct(product: unknown): string {
+  const value = String(product ?? '').trim().toUpperCase();
+  if (value === 'AC') return 'Surface';
+  if (['AP', 'APL', 'EP'].includes(value)) return 'Priority';
+  return 'Unknown';
+}
+
+function dtdcRate(weightKg: number, service: string, zoneValue: string): number {
+  const zone = DTDC_PRIORITY[zoneValue] ? zoneValue : 'RoI-B';
+  const grams = Math.max(1, weightKg * 1000);
+  if (service === 'Priority') {
+    const [base, add] = DTDC_PRIORITY[zone];
+    return grams <= 500 ? base : base + Math.ceil((grams - 500) / 500) * add;
+  }
+  if (service === 'Surface') {
+    const [base, add, above] = DTDC_SURFACE[zone];
+    if (grams <= 500) return base;
+    if (grams <= 5000) return base + Math.ceil((grams - 500) / 500) * add;
+    return base + 9 * add + Math.ceil((grams - 5000) / 500) * above;
+  }
+  return 0;
+}
+
+function variantWeightGrams(variant: unknown): number {
+  const value = String(variant ?? '').trim().toLowerCase();
+  if (!value || value === 'default title') return 120;
+  if (['single pack', 'pack of 1'].includes(value)) return 30;
+  if (value === 'pack of 2') return 60;
+  if (value === 'pack of 4') return 120;
+  if (value.includes('pack of 4- 25g x 4')) return 180;
+  if (value.includes('pack of 8- 25g x 8')) return 360;
+  if (value.includes('pack of 12- 25g x 12')) return 480;
+  if (value.includes('saver pack- 300g')) return 300;
+  if (['16 units','8 units x 2','4 units x all','4 units x 4'].some((text) => value.includes(text))) return 480;
+  const match = value.match(/pack of\s*(\d+)/);
+  return match ? Number(match[1]) * 30 : 120;
+}
+
+function itemWeightKgFromName(name: unknown): number {
+  const text = String(name ?? '').toLowerCase();
+  const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*g\b/g)].map((m) => Number(m[1]));
+  if (matches.length) return Math.max(...matches) / 1000;
+  return text.includes('mini pack') ? 0.03 : 0.03;
+}
+
+function parseCsvRows(text: string): Record<string, string>[] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let quoted = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (quoted && ch === '"' && next === '"') { cell += '"'; i += 1; continue; }
+    if (ch === '"') { quoted = !quoted; continue; }
+    if (!quoted && ch === ',') { row.push(cell); cell = ''; continue; }
+    if (!quoted && (ch === '\n' || ch === '\r')) {
+      if (ch === '\r' && next === '\n') i += 1;
+      row.push(cell); rows.push(row); row = []; cell = '';
+      continue;
+    }
+    cell += ch;
+  }
+  row.push(cell);
+  if (row.some((v) => v !== '')) rows.push(row);
+  const headers = (rows.shift() ?? []).map((h) => h.trim());
+  return rows.map((values) => Object.fromEntries(headers.map((h, index) => [h, values[index] ?? ''])));
+}
+
+async function readTabularFile(file: UploadedCourierFile): Promise<Record<string, any>[]> {
+  const lower = file.filename.toLowerCase();
+  if (lower.endsWith('.csv') || file.mimetype.includes('csv')) {
+    return parseCsvRows(file.buffer.toString('utf8').replace(/^\uFEFF/, ''));
+  }
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(file.buffer as any);
+  const sheet = workbook.worksheets[0];
+  if (!sheet) return [];
+  const headers = (sheet.getRow(1).values as any[]).slice(1).map((v) => String(v ?? '').trim());
+  const rows: Record<string, any>[] = [];
+  sheet.eachRow((excelRow, rowNumber) => {
+    if (rowNumber === 1) return;
+    const values = (excelRow.values as any[]).slice(1);
+    const row: Record<string, any> = {};
+    headers.forEach((header, index) => { row[header] = values[index] ?? ''; });
+    if (Object.values(row).some((value) => String(value ?? '').trim() !== '')) rows.push(row);
+  });
+  return rows;
+}
+
+function valueFrom(row: Record<string, any>, names: string[]): any {
+  const lower = new Map(Object.keys(row).map((key) => [key.trim().toLowerCase(), key]));
+  const key = names.map((name) => lower.get(name.toLowerCase())).find(Boolean);
+  return key ? row[key] : '';
+}
+
+function detectCourierFileType(filename: string): CourierFileType {
+  const name = filename.toLowerCase();
+  if (name.endsWith('.pdf')) return 'DTDC invoice PDF';
+  if (name.includes('bluedart') || name.includes('blue') || /^blr.*\.csv$/.test(name)) return 'BlueDart invoice';
+  if (name.includes('pincode')) return 'Pincode master';
+  if (name.includes('delivery_challan') || name.includes('challan')) return 'Delivery Challan export';
+  if (name.includes('invoice')) return 'Zoho invoice export';
+  if (name.includes('d2c') || name.includes('shopify')) return 'Shopify D2C export';
+  if (name.includes('dtdc') || name.includes('tracking') || /^bl.*\.xlsx$/.test(name)) return 'DTDC tracking/reference';
+  return 'Unknown';
+}
+
+function parseCourierFileTypes(raw: unknown): Record<string, CourierFileType> {
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!Array.isArray(parsed)) return {};
+    return Object.fromEntries(parsed.map((item) => [String(item.filename), String(item.type) as CourierFileType]));
+  } catch {
+    return {};
+  }
+}
+
+async function buildCourierLookups(files: Record<CourierFileType, UploadedCourierFile | undefined>) {
+  const shopifyRows = await readTabularFile(files['Shopify D2C export']!);
+  const shopifySales = new Map<string, number>();
+  const weights = new Map<string, { dtdc: number; blue: number }>();
+  const shopifyGrouped = new Map<string, Record<string, any>[]>();
+  for (const row of shopifyRows) {
+    const key = courierNormRef(valueFrom(row, ['Order name']));
+    if (!key) continue;
+    shopifySales.set(key, (shopifySales.get(key) ?? 0) + courierMoney(valueFrom(row, ['Total sales'])));
+    shopifyGrouped.set(key, [...(shopifyGrouped.get(key) ?? []), row]);
+  }
+  for (const [key, rows] of shopifyGrouped) {
+    const grams = rows.reduce((sum, row) => sum + variantWeightGrams(valueFrom(row, ['Product variant title'])) * courierMoney(valueFrom(row, ['Quantity ordered'])), 0);
+    const text = rows.map((row) => `${valueFrom(row, ['Product variant title'])} ${valueFrom(row, ['Product title'])}`).join(' ').toLowerCase();
+    const has16 = ['16 units','8 units x 2','4 units x all','4 units x 4'].some((needle) => text.includes(needle));
+    weights.set(key, { dtdc: Math.max((grams + 100) / 1000, has16 ? 0.75 : 0.467), blue: has16 ? 0.675 : 0.42 });
+  }
+
+  const invoiceRows = await readTabularFile(files['Zoho invoice export']!);
+  const invoice = new Map<string, number>();
+  const invoiceWeights = new Map<string, number>();
+  for (const row of invoiceRows) {
+    const key = courierNormInv(valueFrom(row, ['Invoice Number']));
+    if (!key) continue;
+    if (!invoice.has(key)) invoice.set(key, courierMoney(valueFrom(row, ['Total'])));
+    const weight = courierMoney(valueFrom(row, ['Weight'])) || itemWeightKgFromName(valueFrom(row, ['Item Name'])) * courierMoney(valueFrom(row, ['Quantity']));
+    invoiceWeights.set(key, (invoiceWeights.get(key) ?? 0) + weight);
+  }
+
+  const challanRows = await readTabularFile(files['Delivery Challan export']!);
+  const challan = new Map<string, number>();
+  const challanWeights = new Map<string, number>();
+  for (const row of challanRows) {
+    const key = courierNormRef(valueFrom(row, ['Delivery Challan Number'])).toUpperCase();
+    if (!key) continue;
+    if (!challan.has(key)) challan.set(key, courierMoney(valueFrom(row, ['Total'])));
+    const qty = courierMoney(valueFrom(row, ['QuantityOrdered', 'Sum of QuantityOrdered', 'Quantity']));
+    const weight = courierMoney(valueFrom(row, ['Weight'])) || itemWeightKgFromName(valueFrom(row, ['Item Name'])) * qty;
+    challanWeights.set(key, (challanWeights.get(key) ?? 0) + weight);
+  }
+
+  const pincodeRows = await readTabularFile(files['Pincode master']!);
+  const pincode = new Map<string, { zone: string }>();
+  for (const row of pincodeRows) {
+    const pin = courierNormRef(valueFrom(row, ['Pincode']));
+    const category = String(valueFrom(row, ['Category']) ?? '').trim();
+    if (pin) pincode.set(pin.replace(/\.0$/, ''), { zone: COURIER_ZONE_MAP[category] ?? category ?? 'Unmatched' });
+  }
+
+  const trackingCn = new Map<string, string>();
+  const trackingRef = new Map<string, string>();
+  if (files['DTDC tracking/reference']) {
+    const trackingRows = await readTabularFile(files['DTDC tracking/reference']!);
+    for (const row of trackingRows) {
+      const cn = courierNormRef(valueFrom(row, ['Tracking Number']));
+      const ref = courierNormRef(valueFrom(row, ['Customer Reference Number']));
+      const pin = courierNormRef(valueFrom(row, ['Destination Pincode'])).replace(/\.0$/, '');
+      if (cn && pin) trackingCn.set(cn, pin);
+      if (ref && pin) trackingRef.set(ref, pin);
+    }
+  }
+
+  return { shopifySales, weights, invoice, invoiceWeights, challan, challanWeights, pincode, trackingCn, trackingRef };
+}
+
+function courierReferenceStatus(category: string, ref: string, lookups: Awaited<ReturnType<typeof buildCourierLookups>>): { match: 'Matched' | 'Not matched' | 'Skipped'; issue: string } {
+  if (category === 'D2C' || category === 'Return-D2C') {
+    const keys = [courierNormRef(ref), `#${courierNormRef(ref).replace(/^#/, '')}`];
+    return keys.some((key) => lookups.shopifySales.has(key)) ? { match: 'Matched', issue: '' } : { match: 'Not matched', issue: 'Courier shipment reference not found in Shopify D2C export' };
+  }
+  if (category === 'Retail' || category === 'Return-Retail') {
+    return lookups.invoice.has(courierNormInv(ref)) ? { match: 'Matched', issue: '' } : { match: 'Not matched', issue: 'Courier shipment reference not found in Zoho invoice export' };
+  }
+  if (category === 'Retail-DC') {
+    return lookups.challan.has(courierNormRef(ref).toUpperCase()) ? { match: 'Matched', issue: '' } : { match: 'Not matched', issue: 'Courier shipment reference not found in delivery challan export' };
+  }
+  return { match: 'Skipped', issue: `${category} shipment is not checked against order files` };
+}
+
+function enrichCourierSales(category: string, ref: string, lookups: Awaited<ReturnType<typeof buildCourierLookups>>): { sales: number; unmatchedSales: boolean } {
+  if (category === 'D2C' || category === 'Return-D2C') {
+    const keys = [courierNormRef(ref), `#${courierNormRef(ref).replace(/^#/, '')}`];
+    const key = keys.find((candidate) => lookups.shopifySales.has(candidate));
+    return { sales: key ? lookups.shopifySales.get(key)! : 0, unmatchedSales: category === 'D2C' && !key };
+  }
+  if (category === 'Retail' || category === 'Return-Retail') {
+    const key = courierNormInv(ref);
+    return { sales: lookups.invoice.get(key) ?? 0, unmatchedSales: category === 'Retail' && !lookups.invoice.has(key) };
+  }
+  if (category === 'Retail-DC') {
+    const key = courierNormRef(ref).toUpperCase();
+    return { sales: lookups.challan.get(key) ?? 0, unmatchedSales: !lookups.challan.has(key) };
+  }
+  return { sales: 0, unmatchedSales: false };
+}
+
+async function parseDtdcPdf(file: UploadedCourierFile): Promise<{ month: string; rows: Array<Record<string, any>> }> {
+  const parsed = await pdfParse(file.buffer);
+  const text = parsed.text || '';
+  const monthMatch = text.match(/Invoice Date\s*:\s*(\d{2})\/(\d{2})\/(\d{4})/);
+  const month = monthMatch ? `${monthMatch[3]}-${monthMatch[2]}` : 'unknown';
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const rows: Array<Record<string, any>> = [];
+  for (let i = 0; i < lines.length - 1; i += 1) {
+    const legacyFirst = lines[i].match(/^(\d+)\s+\.\s+(\d{2}-\d{2}-\d{4})\s+([A-Z0-9]+)\s+([\d.]+)\s+(.+?)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)$/);
+    if (legacyFirst) {
+      const legacySecond = lines[i + 1].match(/^([A-Z0-9.]+)\s*(.*)$/);
+      if (legacySecond) {
+        rows.push({
+          cn: courierNormRef(legacySecond[1]),
+          date: legacyFirst[2],
+          destination: legacyFirst[3],
+          weight: courierMoney(legacyFirst[4]),
+          ref: courierNormRef(legacyFirst[5] + legacySecond[2]),
+          total: courierMoney(legacyFirst[8]),
+        });
+        i += 1;
+        continue;
+      }
+    }
+
+    if (!/^\d+\s+\.$/.test(lines[i])) continue;
+    const cn = courierNormRef(lines[i + 1]);
+    const detail = lines[i + 2]?.match(/^(\d{2}-\d{2}-\d{4})([A-Z0-9]{3})([\d.]+)(.*)$/);
+    if (!cn || !detail) continue;
+    let ref = detail[4] ?? '';
+    let total = 0;
+    let cursor = i + 3;
+    let endIndex = i + 2;
+    const inlineAmount = ref.match(/^(.*?)(\d+\.\d{2})(\d+\.\d{2})$/);
+    if (inlineAmount) {
+      ref = inlineAmount[1];
+      total = courierMoney(inlineAmount[3]);
+    } else {
+      while (cursor < lines.length && !/^\d+\s+\.$/.test(lines[cursor])) {
+        const amountLine = lines[cursor].match(/^0?(\d+\.\d{2})(\d+\.\d{2})$/);
+        if (amountLine) {
+          total = courierMoney(amountLine[2]);
+          endIndex = cursor;
+          break;
+        }
+        ref += lines[cursor];
+        endIndex = cursor;
+        cursor += 1;
+      }
+    }
+    rows.push({
+      cn,
+      date: detail[1],
+      destination: detail[2],
+      weight: courierMoney(detail[3]),
+      ref: courierNormRef(ref),
+      total,
+    });
+    i = Math.max(i, endIndex);
+  }
+  return { month, rows };
+}
+
+async function analyzeDtdc(files: Record<CourierFileType, UploadedCourierFile | undefined>, lookups: Awaited<ReturnType<typeof buildCourierLookups>>): Promise<{ month: string; rows: CourierShipmentRow[] }> {
+  const parsed = await parseDtdcPdf(files['DTDC invoice PDF']!);
+  const rows = parsed.rows.map((raw) => {
+    const category = courierClassify(raw.ref, raw.cn);
+    const service = dtdcServiceFromCn(raw.cn);
+    const pincode = lookups.trackingCn.get(courierNormRef(raw.cn)) || lookups.trackingRef.get(courierNormRef(raw.ref)) || '';
+    const zone = pincode ? (lookups.pincode.get(pincode)?.zone ?? 'Unmatched') : 'Unmatched';
+    const sales = enrichCourierSales(category, raw.ref, lookups);
+    const reference = courierReferenceStatus(category, raw.ref, lookups);
+    let ourWeight = 0;
+    if (category === 'D2C') ourWeight = lookups.weights.get(courierNormRef(raw.ref))?.dtdc ?? 0;
+    if (category === 'Retail') ourWeight = lookups.invoiceWeights.get(courierNormInv(raw.ref)) ?? 0;
+    if (category === 'Retail-DC') ourWeight = lookups.challanWeights.get(courierNormRef(raw.ref).toUpperCase()) ?? 0;
+    const billedSlab = courierSlab(raw.weight);
+    const ourSlab = ourWeight ? courierSlab(ourWeight) : billedSlab;
+    const weightType: CourierShipmentRow['weightType'] = billedSlab === ourSlab ? 'Type A' : billedSlab > ourSlab ? 'Type B' : 'Type C';
+    const expectedCharge = dtdcRate(ourWeight || raw.weight, service, zone);
+    const rateDifference = raw.total - expectedCharge;
+    return {
+      courier: 'DTDC' as const, month: parsed.month, cn: raw.cn, date: raw.date, ref: raw.ref, destination: raw.destination,
+      pincode, category, service, zone, sales: sales.sales, weight: raw.weight, actualWeight: 0, ourWeight,
+      billedSlab, ourSlab, weightType, total: raw.total, expectedCharge, rateDifference,
+      overcharge: weightType === 'Type B' ? Math.max(0, rateDifference) : 0,
+      unmatched: sales.unmatchedSales || category === 'Unknown' || zone === 'Unmatched',
+      referenceMatch: reference.match, referenceIssue: reference.issue,
+    };
+  });
+  return { month: parsed.month, rows };
+}
+
+async function analyzeBlue(files: Record<CourierFileType, UploadedCourierFile | undefined>, lookups: Awaited<ReturnType<typeof buildCourierLookups>>): Promise<{ month: string; rows: CourierShipmentRow[] }> {
+  const blueRows = await readTabularFile(files['BlueDart invoice']!);
+  const dates = blueRows.map((row) => new Date(valueFrom(row, ['P/u Date', 'Pickup Date']))).filter((date) => !Number.isNaN(date.getTime()));
+  const firstDate = dates.sort((a, b) => a.getTime() - b.getTime())[0];
+  const month = firstDate ? `${firstDate.getFullYear()}-${String(firstDate.getMonth() + 1).padStart(2, '0')}` : 'unknown';
+  const rows = blueRows.map((raw) => {
+    const ref = courierNormRef(valueFrom(raw, ['Ref No', 'Ref No Clean', 'Reference No']));
+    const cn = courierNormRef(valueFrom(raw, ['AWB No', 'Awb No']));
+    const category = courierClassify(ref, cn);
+    const pincode = courierNormRef(valueFrom(raw, ['DESTPINCODE', 'Destination Pin'])).replace(/\.0$/, '');
+    const zone = pincode ? (lookups.pincode.get(pincode)?.zone ?? 'Unmatched') : 'Unmatched';
+    const actualWeight = courierMoney(valueFrom(raw, ['Actual Wt']));
+    const billedWeight = courierMoney(valueFrom(raw, ['Billed Wt', 'Bileld Wt']));
+    const total = courierMoney(valueFrom(raw, ['Total']));
+    const orderKey = /^GG\d+/i.test(ref) ? `#${ref.replace(/^#/, '')}` : ref;
+    const ourWeight = Math.max(actualWeight, lookups.weights.get(orderKey)?.blue ?? 0.42);
+    const billedSlab = courierSlab(billedWeight);
+    const ourSlab = courierSlab(ourWeight);
+    const weightType: CourierShipmentRow['weightType'] = billedSlab === ourSlab ? 'Type A' : billedSlab > ourSlab ? 'Type B' : 'Type C';
+    const sales = enrichCourierSales(category, ref, lookups);
+    const reference = courierReferenceStatus(category, ref, lookups);
+    const expectedCharge = weightType === 'Type B' && billedSlab ? total * (ourSlab / billedSlab) : total;
+    return {
+      courier: 'BlueDart' as const, month, cn, date: String(valueFrom(raw, ['P/u Date', 'Pickup Date']) ?? '').slice(0, 10),
+      ref, destination: String(valueFrom(raw, ['Destination']) ?? ''), pincode, category,
+      service: blueServiceFromProduct(valueFrom(raw, ['Product'])), zone, sales: sales.sales,
+      weight: billedWeight, actualWeight, ourWeight, billedSlab, ourSlab, weightType, total,
+      expectedCharge, rateDifference: total - expectedCharge,
+      overcharge: weightType === 'Type B' ? Math.max(0, total - expectedCharge) : 0,
+      unmatched: sales.unmatchedSales || ['Unknown', 'Other'].includes(category) || zone === 'Unmatched',
+      referenceMatch: reference.match, referenceIssue: reference.issue,
+    };
+  });
+  return { month, rows };
+}
+
+function summarizeCourier(courier: 'DTDC' | 'BlueDart', month: string, rows: CourierShipmentRow[]): Omit<CourierReportSummary, 'disputeFile' | 'summaryFile'> {
+  const d2c = rows.filter((row) => row.category === 'D2C');
+  const retail = rows.filter((row) => ['Retail', 'Retail-DC'].includes(row.category));
+  const deliveryPct = (group: CourierShipmentRow[]) => {
+    const sales = group.reduce((sum, row) => sum + row.sales, 0);
+    return sales ? group.reduce((sum, row) => sum + row.total, 0) / sales * 100 : 0;
+  };
+  return {
+    courier, month, shipments: rows.length,
+    d2cDeliveryPct: deliveryPct(d2c),
+    retailDeliveryPct: deliveryPct(retail),
+    totalOvercharge: rows.reduce((sum, row) => sum + row.overcharge, 0),
+    unmatched: rows.filter((row) => row.unmatched).length,
+    referenceIssues: rows.filter((row) => row.referenceMatch === 'Not matched').length,
+    typeA: rows.filter((row) => row.weightType === 'Type A').length,
+    typeB: rows.filter((row) => row.weightType === 'Type B').length,
+    typeC: rows.filter((row) => row.weightType === 'Type C').length,
+  };
+}
+
+function addCourierRows(sheet: ExcelJS.Worksheet, rows: any[], columns: Array<{ header: string; key: string; width?: number }>) {
+  sheet.columns = columns;
+  sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF143D36' } };
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
+  rows.forEach((row) => sheet.addRow(row));
+  sheet.columns.forEach((column) => {
+    column.width = column.width ?? Math.min(Math.max(String(column.header).length + 4, 12), 32);
+    if (['sales', 'total', 'expectedCharge', 'rateDifference', 'overcharge'].includes(String(column.key))) {
+      column.numFmt = '₹#,##0.00';
+    }
+    if (['weight', 'actualWeight', 'ourWeight'].includes(String(column.key))) column.numFmt = '0.000';
+    if (String(column.key).toLowerCase().includes('pct')) column.numFmt = '0.0%';
+  });
+}
+
+async function buildCourierWorkbook(reports: Array<{ courier: 'DTDC' | 'BlueDart'; month: string; rows: CourierShipmentRow[] }>): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  const allRows = reports.flatMap((report) => report.rows);
+  const summaryRows = reports.flatMap((report) => {
+    const buckets = [
+      ['D2C', report.rows.filter((row) => row.category === 'D2C')],
+      ['Retail', report.rows.filter((row) => ['Retail', 'Retail-DC'].includes(row.category))],
+      ['Returns', report.rows.filter((row) => row.category.startsWith('Return'))],
+      ['Samples/Others', report.rows.filter((row) => ['Sample', 'Unknown', 'Other'].includes(row.category))],
+      ['TOTAL', report.rows],
+    ] as const;
+    return buckets.map(([section, rows]) => {
+      const sales = rows.reduce((sum, row) => sum + row.sales, 0);
+      const delivery = rows.reduce((sum, row) => sum + row.total, 0);
+      return {
+        courier: report.courier, section, shipments: rows.length, sales, delivery,
+        deliveryPct: sales ? delivery / sales : 0,
+        typeA: rows.filter((row) => row.weightType === 'Type A').length,
+        typeB: rows.filter((row) => row.weightType === 'Type B').length,
+        typeC: rows.filter((row) => row.weightType === 'Type C').length,
+        overcharge: rows.reduce((sum, row) => sum + row.overcharge, 0),
+        unmatched: rows.filter((row) => row.unmatched).length,
+        referenceIssues: rows.filter((row) => row.referenceMatch === 'Not matched').length,
+      };
+    });
+  });
+  addCourierRows(workbook.addWorksheet('Courier Summary'), summaryRows, [
+    { header: 'Courier', key: 'courier' }, { header: 'Section', key: 'section' }, { header: 'Shipments', key: 'shipments' },
+    { header: 'Sales', key: 'sales' }, { header: 'Delivery Charge', key: 'delivery' }, { header: 'Delivery %', key: 'deliveryPct' },
+    { header: 'Type A', key: 'typeA' }, { header: 'Type B', key: 'typeB' }, { header: 'Type C', key: 'typeC' },
+    { header: 'Overcharge', key: 'overcharge' }, { header: 'Unmatched', key: 'unmatched' }, { header: 'Reference Issues', key: 'referenceIssues' },
+  ]);
+  const detailColumns = [
+    { header: 'Courier', key: 'courier' }, { header: 'CN/AWB', key: 'cn' }, { header: 'Date', key: 'date' }, { header: 'Ref No', key: 'ref' },
+    { header: 'Destination', key: 'destination' }, { header: 'Pincode', key: 'pincode' }, { header: 'Category', key: 'category' },
+    { header: 'Service', key: 'service' }, { header: 'Zone', key: 'zone' }, { header: 'Sales', key: 'sales' }, { header: 'Billed Wt', key: 'weight' },
+    { header: 'Actual Wt', key: 'actualWeight' }, { header: 'Our Wt', key: 'ourWeight' }, { header: 'Billed Slab', key: 'billedSlab' },
+    { header: 'Our Slab', key: 'ourSlab' }, { header: 'Weight Type', key: 'weightType' }, { header: 'Charged', key: 'total' },
+    { header: 'Expected', key: 'expectedCharge' }, { header: 'Rate Difference', key: 'rateDifference' }, { header: 'Overcharge', key: 'overcharge' },
+    { header: 'Unmatched', key: 'unmatched' }, { header: 'Reference Match', key: 'referenceMatch' }, { header: 'Reference Issue', key: 'referenceIssue', width: 42 },
+  ];
+  addCourierRows(workbook.addWorksheet('All Shipments'), allRows, detailColumns);
+  addCourierRows(workbook.addWorksheet('Flagged Courier Shipments'), allRows.filter((row) => row.referenceMatch === 'Not matched'), [
+    { header: 'Courier', key: 'courier' }, { header: 'CN/AWB', key: 'cn' }, { header: 'Date', key: 'date' }, { header: 'Ref No', key: 'ref' },
+    { header: 'Category', key: 'category' }, { header: 'Reference Match', key: 'referenceMatch' }, { header: 'Reference Issue', key: 'referenceIssue', width: 42 },
+    { header: 'Charged', key: 'total' },
+  ]);
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
+async function buildCourierSingleWorkbook(courier: 'DTDC' | 'BlueDart', month: string, rows: CourierShipmentRow[], summary: Omit<CourierReportSummary, 'disputeFile' | 'summaryFile'>, disputeOnly: boolean): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  const detailColumns = [
+    { header: 'CN/AWB', key: 'cn' }, { header: 'Date', key: 'date' }, { header: 'Ref No', key: 'ref' }, { header: 'Pincode', key: 'pincode' },
+    { header: 'Category', key: 'category' }, { header: 'Service', key: 'service' }, { header: 'Zone', key: 'zone' }, { header: 'Sales', key: 'sales' },
+    { header: 'Billed Wt', key: 'weight' }, { header: 'Our Wt', key: 'ourWeight' }, { header: 'Billed Slab', key: 'billedSlab' },
+    { header: 'Our Slab', key: 'ourSlab' }, { header: 'Weight Type', key: 'weightType' }, { header: 'Charged', key: 'total' },
+    { header: 'Expected', key: 'expectedCharge' }, { header: 'Rate Difference', key: 'rateDifference' }, { header: 'Overcharge', key: 'overcharge' },
+    { header: 'Unmatched', key: 'unmatched' }, { header: 'Reference Match', key: 'referenceMatch' }, { header: 'Reference Issue', key: 'referenceIssue', width: 42 },
+  ];
+  if (disputeOnly) {
+    const disputed = rows.filter((row) => row.weightType === 'Type B' && row.overcharge > 0);
+    addCourierRows(workbook.addWorksheet('Dispute Summary'), [
+      { category: 'D2C', shipments: disputed.filter((row) => row.category === 'D2C').length, billed: disputed.filter((row) => row.category === 'D2C').reduce((sum, row) => sum + row.total, 0), expected: disputed.filter((row) => row.category === 'D2C').reduce((sum, row) => sum + row.expectedCharge, 0), overcharge: disputed.filter((row) => row.category === 'D2C').reduce((sum, row) => sum + row.overcharge, 0) },
+      { category: 'Retail', shipments: disputed.filter((row) => ['Retail', 'Retail-DC'].includes(row.category)).length, billed: disputed.filter((row) => ['Retail', 'Retail-DC'].includes(row.category)).reduce((sum, row) => sum + row.total, 0), expected: disputed.filter((row) => ['Retail', 'Retail-DC'].includes(row.category)).reduce((sum, row) => sum + row.expectedCharge, 0), overcharge: disputed.filter((row) => ['Retail', 'Retail-DC'].includes(row.category)).reduce((sum, row) => sum + row.overcharge, 0) },
+      { category: 'Total', shipments: disputed.length, billed: disputed.reduce((sum, row) => sum + row.total, 0), expected: disputed.reduce((sum, row) => sum + row.expectedCharge, 0), overcharge: disputed.reduce((sum, row) => sum + row.overcharge, 0) },
+    ], [
+      { header: 'Category', key: 'category' }, { header: 'Shipments Disputed', key: 'shipments' }, { header: 'Amount Billed', key: 'billed' },
+      { header: 'Expected Amount', key: 'expected' }, { header: 'Overcharge to Credit', key: 'overcharge' },
+    ]);
+    addCourierRows(workbook.addWorksheet('Overcharge Details'), disputed, detailColumns);
+  } else {
+    addCourierRows(workbook.addWorksheet('Summary'), Object.entries(summary).map(([metric, value]) => ({ metric, value })), [
+      { header: 'Metric', key: 'metric', width: 24 }, { header: 'Value', key: 'value', width: 20 },
+    ]);
+    addCourierRows(workbook.addWorksheet('D2C Detail'), rows.filter((row) => row.category === 'D2C'), detailColumns);
+    addCourierRows(workbook.addWorksheet('Retail Detail'), rows.filter((row) => ['Retail', 'Retail-DC'].includes(row.category)), detailColumns);
+    addCourierRows(workbook.addWorksheet('Returns & Others'), rows.filter((row) => row.category !== 'D2C' && !['Retail', 'Retail-DC'].includes(row.category)), detailColumns);
+  }
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
+async function uploadCourierObject(path: string, buffer: Buffer, contentType: string): Promise<void> {
+  courierFallbackFiles.set(path, { buffer, contentType, filename: path.split('/').pop() ?? 'report.xlsx' });
+  if (!SUPABASE_ENABLED) return;
+  try {
+    const response = await fetch(`${SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/${COURIER_BUCKET}/${path}`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+        'Content-Type': contentType,
+        'x-upsert': 'true',
+      },
+      body: buffer as any,
+    });
+    if (!response.ok) {
+      const raw = await response.text();
+      console.warn(`Courier storage upload failed (${response.status}): ${raw}`);
+    }
+  } catch (err) {
+    console.warn('Courier storage upload failed; using fallback download cache.', err);
+  }
+}
+
+async function insertCourierRun(row: any): Promise<void> {
+  courierFallbackRuns.unshift(row);
+  if (!SUPABASE_ENABLED) return;
+  try {
+    await supabaseRequest<void>('courier_analysis_runs', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: row,
+    });
+  } catch (err) {
+    console.warn('Courier run DB insert failed; using fallback history.', err);
+  }
+}
+
+app.post('/api/v1/ops/courier-analysis/process', upload.array('files', 12), async (req: Request, res: Response) => {
+  try {
+    const incomingFiles = ((req as any).files ?? []) as Express.Multer.File[];
+    const manualTypes = parseCourierFileTypes(req.body?.fileTypes);
+    const files = incomingFiles.map((file) => ({
+      filename: file.originalname,
+      type: manualTypes[file.originalname] ?? detectCourierFileType(file.originalname),
+      buffer: file.buffer,
+      mimetype: file.mimetype,
+    })) as UploadedCourierFile[];
+    const byType = Object.fromEntries(files.map((file) => [file.type, file])) as Record<CourierFileType, UploadedCourierFile | undefined>;
+    const missing = (['Shopify D2C export', 'Zoho invoice export', 'Delivery Challan export', 'Pincode master'] as CourierFileType[]).filter((type) => !byType[type]);
+    if (!byType['DTDC invoice PDF'] && !byType['BlueDart invoice']) missing.push('DTDC invoice PDF');
+    if (missing.length) {
+      res.status(400).json({ error: 'missing_files', message: `Missing required files: ${missing.join(', ')}` });
+      return;
+    }
+
+    const runId = uuidv4();
+    const lookups = await buildCourierLookups(byType);
+    const reportInputs: Array<{ courier: 'DTDC' | 'BlueDart'; month: string; rows: CourierShipmentRow[] }> = [];
+    if (byType['DTDC invoice PDF']) reportInputs.push({ courier: 'DTDC', ...(await analyzeDtdc(byType, lookups)) });
+    if (byType['BlueDart invoice']) reportInputs.push({ courier: 'BlueDart', ...(await analyzeBlue(byType, lookups)) });
+
+    for (const file of files) {
+      await uploadCourierObject(`${runId}/uploads/${file.filename}`, file.buffer, file.mimetype || 'application/octet-stream');
+    }
+
+    const reports: CourierReportSummary[] = [];
+    for (const report of reportInputs) {
+      const summaryBase = summarizeCourier(report.courier, report.month, report.rows);
+      const safeCourier = report.courier.replace(/\s+/g, '_');
+      const disputeName = `${safeCourier}_${report.month}_dispute.xlsx`;
+      const summaryName = `${safeCourier}_${report.month}_summary.xlsx`;
+      const disputeBuffer = await buildCourierSingleWorkbook(report.courier, report.month, report.rows, summaryBase, true);
+      const summaryBuffer = await buildCourierSingleWorkbook(report.courier, report.month, report.rows, summaryBase, false);
+      await uploadCourierObject(`${runId}/outputs/${disputeName}`, disputeBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      await uploadCourierObject(`${runId}/outputs/${summaryName}`, summaryBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      reports.push({
+        ...summaryBase,
+        disputeFile: `/api/v1/ops/courier-analysis/files/${runId}/outputs/${encodeURIComponent(disputeName)}`,
+        summaryFile: `/api/v1/ops/courier-analysis/files/${runId}/outputs/${encodeURIComponent(summaryName)}`,
+      });
+    }
+
+    const combinedBuffer = await buildCourierWorkbook(reportInputs);
+    await uploadCourierObject(`${runId}/outputs/courier_summary.xlsx`, combinedBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    const allShipmentRows = reportInputs.flatMap((report) => report.rows);
+    const totalSales = allShipmentRows.reduce((sum, row) => sum + row.sales, 0);
+    const totalDeliveryCharge = allShipmentRows.reduce((sum, row) => sum + row.total, 0);
+    const combined = {
+      dtdcShipments: reports.find((report) => report.courier === 'DTDC')?.shipments ?? 0,
+      blueDartShipments: reports.find((report) => report.courier === 'BlueDart')?.shipments ?? 0,
+      totalOvercharge: reports.reduce((sum, report) => sum + report.totalOvercharge, 0),
+      totalUnmatched: reports.reduce((sum, report) => sum + report.unmatched, 0),
+      totalReferenceIssues: reports.reduce((sum, report) => sum + report.referenceIssues, 0),
+      totalSales,
+      totalDeliveryCharge,
+      deliveryPctAgainstSales: totalSales ? (totalDeliveryCharge / totalSales) * 100 : 0,
+    };
+    const result = {
+      runId,
+      createdAt: new Date().toISOString(),
+      reports,
+      combined,
+      courierSummaryFile: `/api/v1/ops/courier-analysis/files/${runId}/outputs/courier_summary.xlsx`,
+    };
+    await insertCourierRun({
+      id: runId,
+      created_at: result.createdAt,
+      status: 'complete',
+      input_files: files.map((file) => ({ filename: file.filename, type: file.type })),
+      summary: combined,
+      reports,
+      courier_summary_path: `${runId}/outputs/courier_summary.xlsx`,
+    });
+    res.json(result);
+  } catch (err) {
+    console.error('Courier analysis failed', err);
+    res.status(500).json({ error: 'courier_analysis_failed', message: err instanceof Error ? err.message : 'Courier analysis failed.' });
+  }
+});
+
+app.get('/api/v1/ops/courier-analysis/runs', async (_req: Request, res: Response) => {
+  if (SUPABASE_ENABLED) {
+    try {
+      const rows = await supabaseRequest<any[]>('courier_analysis_runs?select=id,created_at,status,summary,reports,courier_summary_path&order=created_at.desc&limit=20');
+      res.json({ runs: rows });
+      return;
+    } catch (err) {
+      console.warn('Courier run history DB fetch failed; using fallback history.', err);
+    }
+  }
+  res.json({ runs: courierFallbackRuns.slice(0, 20) });
+});
+
+app.get('/api/v1/ops/courier-analysis/files/:runId/outputs/:fileName', async (req: Request, res: Response) => {
+  const path = `${req.params.runId}/outputs/${req.params.fileName}`;
+  const fallback = courierFallbackFiles.get(path);
+  if (SUPABASE_ENABLED) {
+    try {
+      const response = await fetch(`${SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/${COURIER_BUCKET}/${path}`, {
+        headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}` },
+      });
+      if (response.ok) {
+        const buffer = Buffer.from(await response.arrayBuffer());
+        res.setHeader('Content-Type', response.headers.get('content-type') ?? 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${req.params.fileName}"`);
+        res.send(buffer);
+        return;
+      }
+    } catch (err) {
+      console.warn('Courier storage download failed; using fallback download cache.', err);
+    }
+  }
+  if (!fallback) {
+    res.status(404).json({ error: 'file_not_found' });
+    return;
+  }
+  res.setHeader('Content-Type', fallback.contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${fallback.filename}"`);
+  res.send(fallback.buffer);
+});
+
 // --- ZOHO INTEGRATION REMOVED ---
 //
 // The Zoho OAuth flow, the 5-minute polling sync, and the /sync/zoho endpoint
@@ -1844,7 +2588,7 @@ app.post('/api/v1/auth/sync/events', (req: Request, res: Response) => {
 // app.listen() is only called in local development (non-Vercel environments).
 export default app;
 
-if (!process.env.VERCEL) {
+if (!process.env.VERCEL || process.env.FORCE_LOCAL_SERVER === 'true') {
   const PORT = process.env.PORT || 8080;
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
