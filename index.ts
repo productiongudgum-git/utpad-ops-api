@@ -2166,12 +2166,7 @@ function enrichCourierSales(category: string, ref: string, lookups: Awaited<Retu
   return { sales: 0, unmatchedSales: false };
 }
 
-async function parseDtdcPdf(file: UploadedCourierFile): Promise<{ month: string; rows: Array<Record<string, any>> }> {
-  const parsed = await pdfParse(file.buffer);
-  const text = parsed.text || '';
-  const monthMatch = text.match(/Invoice Date\s*:\s*(\d{2})\/(\d{2})\/(\d{4})/);
-  const month = monthMatch ? `${monthMatch[3]}-${monthMatch[2]}` : 'unknown';
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+function parseDtdcBlockRows(lines: string[]): Array<Record<string, any>> {
   const rows: Array<Record<string, any>> = [];
   for (let i = 0; i < lines.length - 1; i += 1) {
     const legacyFirst = lines[i].match(/^(\d+)\s+\.\s+(\d{2}-\d{2}-\d{4})\s+([A-Z0-9]+)\s+([\d.]+)\s+(.+?)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)$/);
@@ -2226,6 +2221,109 @@ async function parseDtdcPdf(file: UploadedCourierFile): Promise<{ month: string;
     });
     i = Math.max(i, endIndex);
   }
+  return rows;
+}
+
+// Annexure rows run RATE, COD and Service Total together with no separator, so the
+// column boundaries can only be recovered from the invoice's own arithmetic: RATE + COD = TOTAL.
+function splitDtdcAmountTail(digits: string): Array<{ cod: number; total: number }> {
+  const splits: Array<{ cod: number; total: number }> = [];
+  for (let rateEnd = 1; rateEnd <= digits.length - 2; rateEnd += 1) {
+    const rateText = digits.slice(0, rateEnd);
+    if (rateText.length > 1 && rateText.startsWith('0')) continue;
+    for (let codEnd = rateEnd + 1; codEnd <= digits.length - 1; codEnd += 1) {
+      const codText = digits.slice(rateEnd, codEnd);
+      const totalText = digits.slice(codEnd);
+      if (codText.length > 1 && codText.startsWith('0')) continue;
+      if (totalText.length > 1 && totalText.startsWith('0')) continue;
+      const rate = Number(rateText);
+      const cod = Number(codText);
+      const total = Number(totalText);
+      if (rate > 0 && total > 0 && rate + cod === total) splits.push({ cod, total });
+    }
+  }
+  return splits;
+}
+
+function parseDtdcAnnexureLine(line: string): Record<string, any> | null {
+  const match = line.match(/^(.*?)(\d{2}-\d{2}-\d{4})([A-Z0-9]{3})(.+)$/);
+  if (!match) return null;
+  const cn = courierNormRef(match[1]);
+  const rest = match[4];
+  const leadingNumber = rest.match(/^\d+(?:\.\d+)?/);
+  if (!cn || !leadingNumber) return null;
+
+  let best: { score: number; row: Record<string, any> } | null = null;
+  for (let weightLength = leadingNumber[0].length; weightLength >= 1; weightLength -= 1) {
+    const weightText = leadingNumber[0].slice(0, weightLength);
+    if (weightText.endsWith('.')) continue;
+    const weight = courierMoney(weightText);
+    if (weight <= 0) continue;
+    const tail = rest.slice(weightLength).match(/^(.*?)(\d*)$/);
+    if (!tail) continue;
+    const refHead = tail[1];
+    const digits = tail[2];
+    for (let keep = 0; keep <= digits.length - 3; keep += 1) {
+      for (const split of splitDtdcAmountTail(digits.slice(keep))) {
+        let score = -keep;
+        if (split.cod === 0) score += 60;
+        if (/SHP\/\d{2}-\d{2}\/$/i.test(refHead)) score += keep === 5 ? 100 : -40;
+        if (refHead && !/^[\d.]+$/.test(refHead)) score += 20;
+        if (weight <= 50) score += 15;
+        if (weightText.replace(/^\d+\.?/, '').length <= 3) score += 5;
+        if (best && score <= best.score) continue;
+        best = {
+          score,
+          row: {
+            cn,
+            date: match[2],
+            destination: match[3],
+            weight,
+            ref: courierNormRef(refHead + digits.slice(0, keep)),
+            total: split.total,
+          },
+        };
+      }
+    }
+  }
+  return best ? best.row : null;
+}
+
+function parseDtdcAnnexureRows(lines: string[]): { rows: Array<Record<string, any>>; unparsed: number } {
+  const rows: Array<Record<string, any>> = [];
+  let unparsed = 0;
+  for (const line of lines) {
+    if (!/^\S*\d{2}-\d{2}-\d{4}/.test(line)) continue;
+    const row = parseDtdcAnnexureLine(line);
+    if (row) rows.push(row);
+    else unparsed += 1;
+  }
+  return { rows, unparsed };
+}
+
+async function parseDtdcPdf(file: UploadedCourierFile): Promise<{ month: string; rows: Array<Record<string, any>> }> {
+  const parsed = await pdfParse(file.buffer);
+  const text = parsed.text || '';
+  const monthMatch = text.match(/Invoice Date\s*:\s*(\d{2})\/(\d{2})\/(\d{4})/);
+  const month = monthMatch ? `${monthMatch[3]}-${monthMatch[2]}` : 'unknown';
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+  // DTDC switched from a numbered block per shipment to a flat annexure table in Aug 2026.
+  // Older invoices still come through in the block format, so read with both and keep
+  // whichever recognised more shipments.
+  const blockRows = parseDtdcBlockRows(lines);
+  const annexure = parseDtdcAnnexureRows(lines);
+  const useAnnexure = annexure.rows.length > blockRows.length;
+  const rows = useAnnexure ? annexure.rows : blockRows;
+
+  const statedTotal = courierMoney((text.match(/Freight Charges([\d,]+\.\d{2})/) ?? [])[1]);
+  const parsedTotal = rows.reduce((sum, row) => sum + courierMoney(row.total), 0);
+  console.log(`DTDC invoice ${month}: ${useAnnexure ? 'annexure' : 'block'} layout, ${rows.length} shipments, parsed ₹${parsedTotal.toFixed(2)}, invoice ₹${statedTotal.toFixed(2)}`);
+  if (!rows.length) console.warn('DTDC invoice produced no shipment rows — the invoice layout may have changed again.');
+  else if (statedTotal && Math.abs(parsedTotal - statedTotal) > 1) {
+    console.warn(`DTDC invoice does not reconcile: ₹${(parsedTotal - statedTotal).toFixed(2)} gap over ${rows.length} rows, ${useAnnexure ? annexure.unparsed : 0} line(s) unreadable.`);
+  }
+
   return { month, rows };
 }
 
