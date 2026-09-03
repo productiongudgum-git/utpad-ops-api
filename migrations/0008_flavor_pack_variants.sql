@@ -156,3 +156,5 @@ notify pgrst, 'reload schema';
 --   -- nesting guard works (both should raise):
 --   -- update gg_flavors set parent_flavor_id = id where id = '<any id>';
 -- ──────────────────────────────────────────────────────────────────────
+
+-- Applied to prod: 2026-09-03 by productiongudgum-git
