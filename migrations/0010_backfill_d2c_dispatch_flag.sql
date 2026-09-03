@@ -73,3 +73,5 @@ update public.dispatch_events
 --    where is_dispatched is distinct from true
 --      and invoice_number not like 'D2C-%';
 -- ──────────────────────────────────────────────────────────────────────
+
+-- Applied to prod: 2026-09-03 by productiongudgum-git

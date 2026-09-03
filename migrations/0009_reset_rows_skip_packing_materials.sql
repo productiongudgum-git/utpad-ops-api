@@ -100,3 +100,5 @@ NOTIFY pgrst, 'reload schema';
 --   --    screen and confirm current_qty is unchanged for that flavour's
 --   --    monocarton and for the generic ziplocks.
 -- ──────────────────────────────────────────────────────────────────────
+
+-- Applied to prod: 2026-09-03 by productiongudgum-git

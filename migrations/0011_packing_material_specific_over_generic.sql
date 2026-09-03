@@ -103,3 +103,5 @@ NOTIFY pgrst, 'reload schema';
 --   --    confirm the generic ziplock's current_qty did NOT move, while the
 --   --    variant's own ziplock dropped by 1.
 -- ──────────────────────────────────────────────────────────────────────
+
+-- Applied to prod: 2026-09-03 by productiongudgum-git
