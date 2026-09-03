@@ -612,6 +612,13 @@ async function runProductionInventoryDeduction(event: OperationEvent): Promise<P
   }
 
   // 1. Resolve recipe ID
+  //
+  // Packing variants need no special handling here. Production always runs
+  // against a base flavour — the box format is chosen later, at packing — so a
+  // variant should never reach this path. If one ever did (bad data entry), it
+  // carries no recipe of its own and falls out at the guard below as
+  // "No recipe linked", which is the right outcome: deducting ingredients twice
+  // for one physical batch would be worse than deducting none.
   let recipeId: string | null = null;
   if (typeof event.payload.recipe_id === 'string' && event.payload.recipe_id) {
     recipeId = event.payload.recipe_id;
@@ -1163,14 +1170,25 @@ async function computeFifoForFlavor(
   return { splits, shortfall: Math.max(0, remaining), totalAvailable };
 }
 
-/** Per-flavour finished-goods available — used by mobile picker + web pending tab. */
+/** Per-flavour finished-goods available — used by mobile picker + web pending tab.
+ *
+ *  Packing variants (Lemon 10s and the like) are gg_flavors rows in their own
+ *  right and appear here as separate lines. That is correct and deliberate: a
+ *  10-gum box and a 15-gum box are different goods with separate stock, and the
+ *  FIFO below already keys on flavor_id, so nothing nets them together.
+ *
+ *  units_per_box and parent_flavor_id are returned so callers can label the two
+ *  lines apart — without them a picker shows "Lemon" and "Lemon 10s" with no
+ *  indication that the box sizes differ. */
 app.get('/api/v1/ops/finished-goods-available', async (_req: Request, res: Response) => {
   if (!SUPABASE_ENABLED) {
     res.status(503).json({ error: 'supabase_disabled' });
     return;
   }
   try {
-    const flavors = await supabaseRequest<any[]>('gg_flavors?select=id,name&active=eq.true&order=name.asc');
+    const flavors = await supabaseRequest<any[]>(
+      'gg_flavors?select=id,name,units_per_box,parent_flavor_id&active=eq.true&order=name.asc',
+    );
     const packed = await supabaseRequest<any[]>('packing_sessions?select=flavor_id,boxes_packed&limit=100000');
     const dispatched = await supabaseRequest<any[]>('dispatch_events?select=sku_id,boxes_dispatched&limit=100000');
 
@@ -1189,6 +1207,8 @@ app.get('/api/v1/ops/finished-goods-available', async (_req: Request, res: Respo
       flavor_id: f.id,
       flavor_name: f.name,
       boxes_available: (packedBy.get(f.id) ?? 0) - (dispatchedBy.get(f.id) ?? 0),
+      units_per_box: Number(f.units_per_box ?? 15),
+      parent_flavor_id: f.parent_flavor_id ?? null,
     }));
     res.json(rows);
   } catch (error) {
